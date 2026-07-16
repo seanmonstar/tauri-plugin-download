@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use crate::Error;
 use crate::downloader;
 use crate::models::*;
-use crate::store::{DownloadStore, UpdateIfStatusResult};
+use crate::store::{DeleteIfStatusResult, DownloadStore, PersistMode, UpdateIfStatusResult};
 use crate::validate;
 
 type HttpClient = reqwest_middleware::ClientWithMiddleware;
@@ -35,6 +35,23 @@ pub struct DownloadManager {
    pub(crate) store: DownloadStore,
    pub(crate) on_changed: OnChanged,
    connection_status: ConnectionStatusProvider,
+}
+
+/// Capabilities available to one running download task.
+///
+/// Its fields are private so the downloader cannot bypass the status-aware
+/// operations and write directly to the store.
+pub(crate) struct ActiveDownload<'a> {
+   manager: &'a DownloadManager,
+   item: DownloadRecord,
+}
+
+/// Outcome of checking whether a download remains active.
+pub(crate) enum Active<T> {
+   /// The download remains active. Contains the capability required to continue.
+   Active(T),
+   /// The download was paused, canceled, removed, or otherwise no longer active.
+   NoLongerActive,
 }
 
 impl DownloadManager {
@@ -120,10 +137,11 @@ impl DownloadManager {
          .filter(|item| item.status == DownloadStatus::InProgress)
       {
          // Revert to a recoverable state so the download can be retried.
-         match self.revert_in_progress(&item) {
-            Ok(reverted) => {
+         match self.revert_in_progress(&item.path) {
+            Ok(Some(reverted)) => {
                info!(file = %filename(&reverted.path), status = %reverted.status, "Reverted download item")
             }
+            Ok(None) => {}
             Err(e) => warn!(file = %filename(&item.path), "Failed to revert download item: {}", e),
          }
       }
@@ -311,19 +329,17 @@ impl DownloadManager {
       // Build the item without emitting — the download task will emit progress updates.
       let public_item = item_in_progress.to_item();
       tokio::spawn(async move {
-         if let Err(e) = downloader::download(&manager, item_in_progress).await {
+         let active = ActiveDownload::new(&manager, item_in_progress);
+         if let Err(e) = downloader::download(active).await {
             error!(file = %filename(&path), "Download {}: {}", err_msg, e);
 
-            // Revert unless already paused or canceled.
-            if let Ok(Some(current)) = manager.store.find_by_path(&path)
-               && current.status == DownloadStatus::InProgress
-            {
-               match manager.revert_in_progress(&current) {
-                  Ok(reverted) => {
-                     info!(file = %filename(&reverted.path), status = %reverted.status, "Reverted download item")
-                  }
-                  Err(e) => warn!(file = %filename(&path), "Failed to revert download item: {}", e),
+            // Revert atomically unless already paused or canceled.
+            match manager.revert_in_progress(&path) {
+               Ok(Some(reverted)) => {
+                  info!(file = %filename(&reverted.path), status = %reverted.status, "Reverted download item")
                }
+               Ok(None) => {}
+               Err(e) => warn!(file = %filename(&path), "Failed to revert download item: {}", e),
             }
          }
       });
@@ -363,24 +379,19 @@ impl DownloadManager {
    pub fn pause(&self, path: &str) -> crate::Result<DownloadActionResponse> {
       validate::path(path)?;
 
-      let item = self
+      match self
          .store
-         .find_by_path(path)?
-         .ok_or_else(|| Error::NotFound(path.to_string()))?;
-      match item.status {
-         // Allow download to be paused when in progress.
-         DownloadStatus::InProgress => {
-            let paused = item.with_status(DownloadStatus::Paused);
-            self.store.update(paused.clone())?;
+         .update_if_status(path, DownloadStatus::InProgress, DownloadStatus::Paused)?
+      {
+         UpdateIfStatusResult::Updated(paused) => {
             let event = self.emit_changed(&paused);
             Ok(DownloadActionResponse::new(event))
          }
-
-         // Return current state if in any other state.
-         _ => Ok(DownloadActionResponse::with_expected_status(
+         UpdateIfStatusResult::Unchanged(item) => Ok(DownloadActionResponse::with_expected_status(
             item.to_item(),
             DownloadStatus::Paused,
          )),
+         UpdateIfStatusResult::NotFound => Err(Error::NotFound(path.to_string())),
       }
    }
 
@@ -395,14 +406,15 @@ impl DownloadManager {
    pub fn cancel(&self, path: &str) -> crate::Result<DownloadActionResponse> {
       validate::path(path)?;
 
-      let item = self
-         .store
-         .find_by_path(path)?
-         .ok_or_else(|| Error::NotFound(path.to_string()))?;
-      match item.status {
-         // Allow download to be canceled when created, in progress or paused.
-         DownloadStatus::Idle | DownloadStatus::InProgress | DownloadStatus::Paused => {
-            self.store.delete(&item.path)?;
+      match self.store.delete_if_status(
+         path,
+         &[
+            DownloadStatus::Idle,
+            DownloadStatus::InProgress,
+            DownloadStatus::Paused,
+         ],
+      )? {
+         DeleteIfStatusResult::Deleted(item) => {
             let temp_path = format!("{}{}", item.path, DOWNLOAD_SUFFIX);
             if fs::remove_file(&temp_path).is_err() {
                debug!(file = %filename(&item.path), "Temp file was not found or could not be deleted");
@@ -412,36 +424,29 @@ impl DownloadManager {
             let event = self.emit_changed(&canceled);
             Ok(DownloadActionResponse::new(event))
          }
-
-         // Return current state if in any other state.
-         _ => Ok(DownloadActionResponse::with_expected_status(
+         DeleteIfStatusResult::Unchanged(item) => Ok(DownloadActionResponse::with_expected_status(
             item.to_item(),
             DownloadStatus::Canceled,
          )),
+         DeleteIfStatusResult::NotFound => Err(Error::NotFound(path.to_string())),
       }
    }
 
    /// Reverts an `InProgress` download record to `Paused` or `Idle` based on
    /// whether a temp file exists on disk. No-op for other statuses.
-   fn revert_in_progress(&self, item: &DownloadRecord) -> crate::Result<DownloadRecord> {
-      if item.status != DownloadStatus::InProgress {
-         return Ok(item.clone());
-      }
-
-      let temp_path = format!("{}{}", item.path, DOWNLOAD_SUFFIX);
-      let reverted = if let Ok(meta) = fs::metadata(&temp_path) {
+   fn revert_in_progress(&self, path: &str) -> crate::Result<Option<DownloadRecord>> {
+      let temp_path = format!("{}{}", path, DOWNLOAD_SUFFIX);
+      let (received_bytes, status) = if let Ok(meta) = fs::metadata(&temp_path) {
          // Metadata succeeded, so the temp file exists — recover byte count from it.
-         item
-            .with_bytes(meta.len(), item.total_bytes)
-            .with_status(DownloadStatus::Paused)
+         (meta.len(), DownloadStatus::Paused)
       } else {
-         item
-            .with_bytes(0, item.total_bytes)
-            .with_status(DownloadStatus::Idle)
+         (0, DownloadStatus::Idle)
       };
 
-      self.store.update(reverted.clone())?;
-      self.emit_changed(&reverted);
+      let reverted = self.store.revert_active(path, received_bytes, status)?;
+      if let Some(reverted) = &reverted {
+         self.emit_changed(reverted);
+      }
       Ok(reverted)
    }
 
@@ -450,6 +455,112 @@ impl DownloadManager {
       debug!(file = %filename(&item.path), status = %item.status, received_bytes = item.received_bytes, total_bytes = ?item.total_bytes);
       (self.on_changed)(public_item.clone());
       public_item
+   }
+}
+
+impl<'a> ActiveDownload<'a> {
+   /// Creates a restricted view of `manager` for the running download represented by `item`.
+   pub(crate) fn new(manager: &'a DownloadManager, item: DownloadRecord) -> Self {
+      Self { manager, item }
+   }
+
+   /// Returns the final destination path for this download.
+   pub(crate) fn path(&self) -> &str {
+      &self.item.path
+   }
+
+   /// Returns the source URL for this download.
+   pub(crate) fn url(&self) -> &str {
+      &self.item.url
+   }
+
+   /// Returns the shared HTTP client used to fetch this download.
+   pub(crate) fn http_client(&self) -> &HttpClient {
+      &self.manager.http_client
+   }
+
+   /// Updates header-derived byte counts if the download is still in progress.
+   /// The record is persisted only when the known total changes.
+   ///
+   /// Returns [`Active::Active`] when the record was updated, or
+   /// [`Active::NoLongerActive`] when an external action has already paused,
+   /// canceled, or otherwise ended the download.
+   pub(crate) fn persist_headers(
+      mut self,
+      received_bytes: u64,
+      total_bytes: Option<u64>,
+   ) -> crate::Result<Active<Self>> {
+      let persist_mode = if self.item.total_bytes == total_bytes {
+         PersistMode::InMemoryOnly
+      } else {
+         PersistMode::ToDisk
+      };
+      let updated = self.manager.store.update_active_bytes(
+         self.path(),
+         received_bytes,
+         total_bytes,
+         persist_mode,
+      )?;
+      Ok(match updated {
+         Some(updated) => {
+            self.item = updated;
+            Active::Active(self)
+         }
+         None => Active::NoLongerActive,
+      })
+   }
+
+   /// Records and emits a progress checkpoint if the download is still in progress.
+   ///
+   /// Returns [`Active::Active`] when the checkpoint was recorded, or
+   /// [`Active::NoLongerActive`] when an external action has already paused,
+   /// canceled, or otherwise ended the download.
+   pub(crate) fn checkpoint(
+      self,
+      received_bytes: u64,
+      total_bytes: Option<u64>,
+   ) -> crate::Result<Active<Self>> {
+      let Some(updated) = self.manager.store.update_active_bytes(
+         self.path(),
+         received_bytes,
+         total_bytes,
+         PersistMode::InMemoryOnly,
+      )?
+      else {
+         return Ok(Active::NoLongerActive);
+      };
+      self.manager.emit_changed(&updated);
+      Ok(Active::Active(self))
+   }
+
+   /// Publishes a completed file only if the download is still active.
+   pub(crate) fn finish(
+      self,
+      temp_path: &str,
+      received_bytes: u64,
+      total_bytes: Option<u64>,
+   ) -> crate::Result<()> {
+      let completed =
+         self
+            .manager
+            .store
+            .complete_active(self.path(), received_bytes, total_bytes, || {
+               // On Windows rename does not replace an existing destination.
+               #[cfg(windows)]
+               if Path::new(self.path()).exists() {
+                  fs::remove_file(self.path()).map_err(|e| {
+                     Error::File(format!("Failed to remove existing destination file: {}", e))
+                  })?;
+               }
+
+               fs::rename(temp_path, self.path()).map_err(|e| {
+                  Error::File(format!("Failed to rename temp file to destination: {}", e))
+               })
+            })?;
+      if let Some(completed) = completed {
+         self.manager.emit_changed(&completed);
+      }
+      Ok(())
    }
 }
 
@@ -606,6 +717,178 @@ mod tests {
          .unwrap();
    }
 
+   #[test]
+   fn test_active_download_checkpoint_respects_pause() {
+      let (manager, _dir, events) = make_manager();
+      let path = "/tmp/checkpoint.mp4";
+      seed(&manager, path, DownloadStatus::InProgress);
+      let item = manager.store.find_by_path(path).unwrap().unwrap();
+      let active = ActiveDownload::new(&manager, item);
+
+      manager.pause(path).unwrap();
+      clear_events(&events);
+
+      assert!(matches!(
+         active.checkpoint(500, Some(1000)).unwrap(),
+         Active::NoLongerActive
+      ));
+      let stored = manager.store.find_by_path(path).unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 0);
+      assert_eq!(stored.total_bytes, None);
+      assert!(event_log(&events).is_empty());
+   }
+
+   #[test]
+   fn test_active_download_header_persist_respects_pause() {
+      let (manager, dir, _events) = make_manager();
+      let path = "/tmp/headers.mp4";
+      seed(&manager, path, DownloadStatus::InProgress);
+      let item = manager.store.find_by_path(path).unwrap().unwrap();
+      let active = ActiveDownload::new(&manager, item);
+
+      manager.pause(path).unwrap();
+
+      assert!(matches!(
+         active.persist_headers(500, Some(1000)).unwrap(),
+         Active::NoLongerActive
+      ));
+
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let stored = reloaded.find_by_path(path).unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 0);
+      assert_eq!(stored.total_bytes, None);
+   }
+
+   #[test]
+   fn test_active_download_does_not_persist_unchanged_total() {
+      let (manager, dir, _events) = make_manager();
+      let path = "/tmp/headers.mp4";
+      let item = manager
+         .store
+         .create(DownloadRecord {
+            url: VALID_URL.to_string(),
+            path: path.to_string(),
+            options: CreateOptions::default(),
+            received_bytes: 0,
+            total_bytes: Some(1000),
+            status: DownloadStatus::InProgress,
+         })
+         .unwrap();
+      let active = ActiveDownload::new(&manager, item);
+
+      assert!(matches!(
+         active.persist_headers(500, Some(1000)).unwrap(),
+         Active::Active(_)
+      ));
+      assert_eq!(
+         manager
+            .store
+            .find_by_path(path)
+            .unwrap()
+            .unwrap()
+            .received_bytes,
+         500
+      );
+
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      assert_eq!(
+         reloaded.find_by_path(path).unwrap().unwrap().received_bytes,
+         0
+      );
+   }
+
+   #[test]
+   fn test_active_download_finish_respects_pause() {
+      let (manager, dir, events) = make_manager();
+      let path = dir
+         .path()
+         .join("complete.mp4")
+         .to_string_lossy()
+         .into_owned();
+      let temp_path = format!("{}{}", path, DOWNLOAD_SUFFIX);
+      fs::write(&temp_path, b"partial").unwrap();
+      seed(&manager, &path, DownloadStatus::InProgress);
+      let item = manager.store.find_by_path(&path).unwrap().unwrap();
+      let active = ActiveDownload::new(&manager, item);
+
+      manager.pause(&path).unwrap();
+      clear_events(&events);
+      active.finish(&temp_path, 7, Some(7)).unwrap();
+
+      assert_eq!(
+         manager.store.find_by_path(&path).unwrap().unwrap().status,
+         DownloadStatus::Paused
+      );
+      assert!(Path::new(&temp_path).exists());
+      assert!(!Path::new(&path).exists());
+      assert!(event_log(&events).is_empty());
+   }
+
+   #[test]
+   fn test_active_download_finish_publishes_active_download() {
+      let (manager, dir, events) = make_manager();
+      let path = dir
+         .path()
+         .join("complete.mp4")
+         .to_string_lossy()
+         .into_owned();
+      let temp_path = format!("{}{}", path, DOWNLOAD_SUFFIX);
+      fs::write(&temp_path, b"complete").unwrap();
+      seed(&manager, &path, DownloadStatus::InProgress);
+      let item = manager.store.find_by_path(&path).unwrap().unwrap();
+      let active = ActiveDownload::new(&manager, item);
+
+      active.finish(&temp_path, 8, Some(8)).unwrap();
+
+      assert!(manager.store.find_by_path(&path).unwrap().is_none());
+      assert_eq!(fs::read(&path).unwrap(), b"complete");
+      let log = event_log(&events);
+      assert_eq!(log.last().unwrap().status, DownloadStatus::Completed);
+      assert_eq!(log.last().unwrap().received_bytes, 8);
+   }
+
+   #[test]
+   fn test_active_download_operations_respect_cancel() {
+      let (manager, dir, events) = make_manager();
+      let path = dir
+         .path()
+         .join("canceled.bin")
+         .to_string_lossy()
+         .into_owned();
+      let temp_path = format!("{}{}", path, DOWNLOAD_SUFFIX);
+      fs::write(&temp_path, b"partial").unwrap();
+      seed(&manager, &path, DownloadStatus::InProgress);
+      let item = manager.store.find_by_path(&path).unwrap().unwrap();
+      let headers = ActiveDownload::new(&manager, item.clone());
+      let checkpoint = ActiveDownload::new(&manager, item.clone());
+      let finish = ActiveDownload::new(&manager, item);
+
+      manager.cancel(&path).unwrap();
+      clear_events(&events);
+      assert!(!Path::new(&temp_path).exists());
+
+      assert!(matches!(
+         headers.persist_headers(7, Some(7)).unwrap(),
+         Active::NoLongerActive
+      ));
+      assert!(matches!(
+         checkpoint.checkpoint(7, Some(7)).unwrap(),
+         Active::NoLongerActive
+      ));
+      // A leftover file must not be published, even if cleanup could not remove it.
+      fs::write(&temp_path, b"partial").unwrap();
+      finish.finish(&temp_path, 7, Some(7)).unwrap();
+
+      assert!(manager.store.find_by_path(&path).unwrap().is_none());
+      assert!(!Path::new(&path).exists());
+      assert_eq!(fs::read(&temp_path).unwrap(), b"partial");
+      assert!(event_log(&events).is_empty());
+   }
+
    // ---------- get ----------
 
    #[test]
@@ -745,6 +1028,61 @@ mod tests {
    }
 
    // ---------- start ----------
+
+   #[tokio::test]
+   async fn test_start_http_failure_reverts_to_idle() {
+      let (manager, dir, events) = make_manager();
+      let server = MockServer::start().await;
+      Mock::given(method("GET"))
+         .and(wm_path("/missing"))
+         .respond_with(ResponseTemplate::new(404))
+         .expect(1)
+         .mount(&server)
+         .await;
+      let path = dir
+         .path()
+         .join("missing.bin")
+         .to_string_lossy()
+         .into_owned();
+      manager
+         .create(&path, &format!("{}/missing", server.uri()))
+         .unwrap();
+      clear_events(&events);
+
+      let response = manager.start(&path).await.unwrap();
+      assert_eq!(response.download.status, DownloadStatus::InProgress);
+      tokio::time::timeout(Duration::from_secs(5), async {
+         loop {
+            if event_log(&events)
+               .iter()
+               .any(|event| event.status == DownloadStatus::Idle)
+            {
+               break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+         }
+      })
+      .await
+      .expect("failed download did not emit recovery");
+
+      let stored = manager.store.find_by_path(&path).unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Idle);
+      assert_eq!(stored.received_bytes, 0);
+      assert!(!Path::new(&path).exists());
+      assert!(!Path::new(&format!("{}{}", path, DOWNLOAD_SUFFIX)).exists());
+      let log = event_log(&events);
+      assert_eq!(log.len(), 1);
+      assert_eq!(log[0].path, path);
+      assert_eq!(log[0].status, DownloadStatus::Idle);
+      assert_eq!(log[0].received_bytes, 0);
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      assert_eq!(
+         reloaded.find_by_path(&path).unwrap().unwrap().status,
+         DownloadStatus::Idle
+      );
+      server.verify().await;
+   }
 
    #[tokio::test]
    async fn test_start_unknown_path_returns_not_found() {

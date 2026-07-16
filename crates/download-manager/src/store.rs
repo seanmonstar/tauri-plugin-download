@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tempfile::NamedTempFile;
 
@@ -12,6 +12,20 @@ pub(crate) enum UpdateIfStatusResult {
    Updated(DownloadRecord),
    Unchanged(DownloadRecord),
    NotFound,
+}
+
+pub(crate) enum DeleteIfStatusResult {
+   Deleted(DownloadRecord),
+   Unchanged(DownloadRecord),
+   NotFound,
+}
+
+/// Controls whether a store mutation is limited to memory or also written to disk.
+pub(crate) enum PersistMode {
+   /// Update only the in-memory record.
+   InMemoryOnly,
+   /// Persist the updated record to disk.
+   ToDisk,
 }
 
 /// Thread-safe JSON file store for download records, mirroring iOS `DownloadStore`.
@@ -71,6 +85,7 @@ impl DownloadStore {
       Ok(item)
    }
 
+   #[cfg(test)]
    pub fn update(&self, item: DownloadRecord) -> crate::Result<()> {
       let mut inner = self
          .inner
@@ -109,6 +124,7 @@ impl DownloadStore {
       Ok(UpdateIfStatusResult::Updated(updated))
    }
 
+   #[cfg(test)]
    pub fn update_no_persist(&self, item: DownloadRecord) -> crate::Result<()> {
       let mut inner = self
          .inner
@@ -121,6 +137,90 @@ impl DownloadStore {
       Ok(())
    }
 
+   /// Returns the locked store and record index only while the download is active.
+   fn lock_active(&self, path: &str) -> crate::Result<Option<(MutexGuard<'_, StoreInner>, usize)>> {
+      let inner = self
+         .inner
+         .lock()
+         .map_err(|e| Error::Store(format!("Lock poisoned: {}", e)))?;
+      let Some(index) = inner.downloads.iter().position(|item| item.path == path) else {
+         return Ok(None);
+      };
+      if inner.downloads[index].status != DownloadStatus::InProgress {
+         return Ok(None);
+      }
+      Ok(Some((inner, index)))
+   }
+
+   /// Updates byte counts only while the download is still active.
+   ///
+   /// The status check and byte update happen under the same lock so a progress
+   /// checkpoint cannot overwrite a concurrent pause with a stale record.
+   pub(crate) fn update_active_bytes(
+      &self,
+      path: &str,
+      received_bytes: u64,
+      total_bytes: Option<u64>,
+      persist_mode: PersistMode,
+   ) -> crate::Result<Option<DownloadRecord>> {
+      let Some((mut inner, index)) = self.lock_active(path)? else {
+         return Ok(None);
+      };
+
+      inner.downloads[index].received_bytes = received_bytes;
+      inner.downloads[index].total_bytes = total_bytes;
+      let updated = inner.downloads[index].clone();
+      if matches!(persist_mode, PersistMode::ToDisk) {
+         save_inner(&inner)?;
+      }
+      Ok(Some(updated))
+   }
+
+   /// Publishes and removes a completed download only while it is still active.
+   ///
+   /// `publish` runs while the store lock is held, so pause and cancel cannot
+   /// interleave between the status check and publishing the completed file.
+   /// It must not re-enter the store because the mutex is not reentrant.
+   pub(crate) fn complete_active(
+      &self,
+      path: &str,
+      received_bytes: u64,
+      total_bytes: Option<u64>,
+      publish: impl FnOnce() -> crate::Result<()>,
+   ) -> crate::Result<Option<DownloadRecord>> {
+      let Some((mut inner, index)) = self.lock_active(path)? else {
+         return Ok(None);
+      };
+
+      publish()?;
+      let completed = inner.downloads[index]
+         .clone()
+         .with_bytes(received_bytes, total_bytes)
+         .with_status(DownloadStatus::Completed);
+      inner.downloads.remove(index);
+      save_inner(&inner)?;
+      Ok(Some(completed))
+   }
+
+   /// Reverts a failed download only while it is still active.
+   pub(crate) fn revert_active(
+      &self,
+      path: &str,
+      received_bytes: u64,
+      status: DownloadStatus,
+   ) -> crate::Result<Option<DownloadRecord>> {
+      let Some((mut inner, index)) = self.lock_active(path)? else {
+         return Ok(None);
+      };
+
+      inner.downloads[index].received_bytes = received_bytes;
+      inner.downloads[index].status = status;
+      let reverted = inner.downloads[index].clone();
+      save_inner(&inner)?;
+      Ok(Some(reverted))
+   }
+
+   #[cfg(test)]
    pub fn delete(&self, path: &str) -> crate::Result<()> {
       let mut inner = self
          .inner
@@ -130,6 +230,31 @@ impl DownloadStore {
       inner.downloads.retain(|i| i.path != path);
       save_inner(&inner)?;
       Ok(())
+   }
+
+   /// Deletes and returns a record only when its status is cancellable.
+   pub(crate) fn delete_if_status(
+      &self,
+      path: &str,
+      expected_statuses: &[DownloadStatus],
+   ) -> crate::Result<DeleteIfStatusResult> {
+      let mut inner = self
+         .inner
+         .lock()
+         .map_err(|e| Error::Store(format!("Lock poisoned: {}", e)))?;
+
+      let Some(index) = inner.downloads.iter().position(|item| item.path == path) else {
+         return Ok(DeleteIfStatusResult::NotFound);
+      };
+      if !expected_statuses.contains(&inner.downloads[index].status) {
+         return Ok(DeleteIfStatusResult::Unchanged(
+            inner.downloads[index].clone(),
+         ));
+      }
+
+      let deleted = inner.downloads.remove(index);
+      save_inner(&inner)?;
+      Ok(DeleteIfStatusResult::Deleted(deleted))
    }
 
    /// Loads the store from disk. Should be called once at startup.
@@ -416,6 +541,48 @@ mod tests {
    }
 
    #[test]
+   fn test_update_active_bytes_does_not_overwrite_pause() {
+      let (store, _dir) = temp_store();
+      let active = sample_record("/tmp/file.mp4").with_status(DownloadStatus::InProgress);
+      store.create(active.clone()).unwrap();
+      store
+         .update(active.with_status(DownloadStatus::Paused))
+         .unwrap();
+
+      let updated = store
+         .update_active_bytes("/tmp/file.mp4", 500, Some(1000), PersistMode::InMemoryOnly)
+         .unwrap();
+
+      assert!(updated.is_none());
+      let stored = store.find_by_path("/tmp/file.mp4").unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 0);
+      assert_eq!(stored.total_bytes, None);
+   }
+
+   #[test]
+   fn test_persist_active_bytes_does_not_overwrite_pause() {
+      let (store, dir) = temp_store();
+      let active = sample_record("/tmp/file.mp4").with_status(DownloadStatus::InProgress);
+      store.create(active.clone()).unwrap();
+      store
+         .update(active.with_status(DownloadStatus::Paused))
+         .unwrap();
+
+      let updated = store
+         .update_active_bytes("/tmp/file.mp4", 500, Some(1000), PersistMode::ToDisk)
+         .unwrap();
+
+      assert!(updated.is_none());
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let stored = reloaded.find_by_path("/tmp/file.mp4").unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 0);
+      assert_eq!(stored.total_bytes, None);
+   }
+
+   #[test]
    fn test_delete_removes_item_and_persists() {
       let (store, dir) = temp_store();
       store.create(sample_record("/tmp/file.mp4")).unwrap();
@@ -426,6 +593,203 @@ mod tests {
       let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
       reloaded.load().unwrap();
       assert!(reloaded.list().unwrap().is_empty());
+   }
+
+   #[test]
+   fn test_delete_if_status_removes_matching_record_and_persists() {
+      let (store, dir) = temp_store();
+      let path = "/tmp/file.mp4";
+      store
+         .create(sample_record(path).with_status(DownloadStatus::Paused))
+         .unwrap();
+      store.create(sample_record("/tmp/other.mp4")).unwrap();
+
+      assert!(matches!(
+         store.delete_if_status(path, &[DownloadStatus::Idle, DownloadStatus::InProgress, DownloadStatus::Paused]).unwrap(),
+         DeleteIfStatusResult::Deleted(item) if item.path == path && item.status == DownloadStatus::Paused
+      ));
+      assert!(store.find_by_path(path).unwrap().is_none());
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let remaining = reloaded.list().unwrap();
+      assert_eq!(remaining.len(), 1);
+      assert_eq!(remaining[0].path, "/tmp/other.mp4");
+   }
+
+   #[test]
+   fn test_delete_if_status_preserves_mismatched_record() {
+      let (store, dir) = temp_store();
+      let path = "/tmp/file.mp4";
+      store
+         .create(sample_record(path).with_status(DownloadStatus::Paused))
+         .unwrap();
+
+      assert!(matches!(
+         store.delete_if_status(path, &[DownloadStatus::Idle]).unwrap(),
+         DeleteIfStatusResult::Unchanged(item) if item.path == path && item.status == DownloadStatus::Paused
+      ));
+      assert_eq!(
+         store.find_by_path(path).unwrap().unwrap().status,
+         DownloadStatus::Paused
+      );
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      assert_eq!(
+         reloaded.find_by_path(path).unwrap().unwrap().status,
+         DownloadStatus::Paused
+      );
+   }
+
+   #[test]
+   fn test_delete_if_status_returns_not_found() {
+      let (store, _dir) = temp_store();
+      assert!(matches!(
+         store
+            .delete_if_status("/tmp/missing.mp4", &[DownloadStatus::InProgress])
+            .unwrap(),
+         DeleteIfStatusResult::NotFound
+      ));
+   }
+
+   #[test]
+   fn test_revert_active_preserves_latest_total_and_persists() {
+      let (store, dir) = temp_store();
+      let path = "/tmp/file.mp4";
+      store
+         .create(sample_record(path).with_status(DownloadStatus::InProgress))
+         .unwrap();
+      store
+         .update_active_bytes(path, 100, Some(1000), PersistMode::InMemoryOnly)
+         .unwrap();
+
+      let reverted = store
+         .revert_active(path, 150, DownloadStatus::Paused)
+         .unwrap()
+         .unwrap();
+      assert_eq!(reverted.status, DownloadStatus::Paused);
+      assert_eq!(reverted.received_bytes, 150);
+      assert_eq!(reverted.total_bytes, Some(1000));
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let stored = reloaded.find_by_path(path).unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 150);
+      assert_eq!(stored.total_bytes, Some(1000));
+   }
+
+   #[test]
+   fn test_revert_active_respects_pause_and_removal() {
+      let (store, dir) = temp_store();
+      let path = "/tmp/file.mp4";
+      store
+         .create(
+            sample_record(path)
+               .with_bytes(100, Some(1000))
+               .with_status(DownloadStatus::Paused),
+         )
+         .unwrap();
+
+      assert!(
+         store
+            .revert_active(path, 0, DownloadStatus::Idle)
+            .unwrap()
+            .is_none()
+      );
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let stored = reloaded.find_by_path(path).unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 100);
+      assert_eq!(stored.total_bytes, Some(1000));
+      assert_eq!(
+         store.find_by_path(path).unwrap().unwrap().received_bytes,
+         100
+      );
+
+      store
+         .delete_if_status(path, &[DownloadStatus::Paused])
+         .unwrap();
+      assert!(
+         store
+            .revert_active(path, 0, DownloadStatus::Idle)
+            .unwrap()
+            .is_none()
+      );
+      assert!(store.find_by_path(path).unwrap().is_none());
+      reloaded.load().unwrap();
+      assert!(reloaded.find_by_path(path).unwrap().is_none());
+   }
+
+   #[test]
+   fn test_complete_active_publish_failure_preserves_record() {
+      let (store, dir) = temp_store();
+      let path = "/tmp/file.mp4";
+      store
+         .create(sample_record(path).with_status(DownloadStatus::InProgress))
+         .unwrap();
+
+      let result = store.complete_active(path, 100, Some(100), || {
+         Err(Error::File("publish failed".to_string()))
+      });
+      assert!(matches!(result, Err(Error::File(message)) if message == "publish failed"));
+      assert_eq!(
+         store.find_by_path(path).unwrap().unwrap().status,
+         DownloadStatus::InProgress
+      );
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      assert_eq!(
+         reloaded.find_by_path(path).unwrap().unwrap().status,
+         DownloadStatus::InProgress
+      );
+   }
+
+   #[test]
+   fn test_complete_active_excludes_cancel_during_publish() {
+      use std::sync::{TryLockError, mpsc};
+
+      let (store, dir) = temp_store();
+      let path = "/tmp/file.mp4";
+      store
+         .create(sample_record(path).with_status(DownloadStatus::InProgress))
+         .unwrap();
+      let (publishing, entered) = mpsc::channel();
+      let (probed, probe_result) = mpsc::channel();
+
+      std::thread::scope(|scope| {
+         let cancel_store = &store;
+         let cancel = scope.spawn(move || {
+            entered.recv().unwrap();
+            // Probe from another thread while publication is suspended. This
+            // detects a split critical section without relying on scheduling delays.
+            let locked = matches!(cancel_store.inner.try_lock(), Err(TryLockError::WouldBlock));
+            probed.send(locked).unwrap();
+            cancel_store
+               .delete_if_status(path, &[DownloadStatus::InProgress])
+               .unwrap()
+         });
+         let completed = store
+            .complete_active(path, 100, Some(100), || {
+               publishing.send(()).unwrap();
+               assert!(
+                  probe_result.recv().unwrap(),
+                  "publication must hold the store lock"
+               );
+               Ok(())
+            })
+            .unwrap()
+            .unwrap();
+         assert_eq!(completed.status, DownloadStatus::Completed);
+         assert_eq!(completed.received_bytes, 100);
+         assert!(matches!(
+            cancel.join().unwrap(),
+            DeleteIfStatusResult::NotFound
+         ));
+      });
+
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      assert!(reloaded.find_by_path(path).unwrap().is_none());
    }
 
    #[test]

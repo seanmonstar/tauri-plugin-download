@@ -5,7 +5,8 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::Error;
-use crate::manager::{DOWNLOAD_SUFFIX, DownloadManager};
+use crate::manager::{Active, ActiveDownload, DOWNLOAD_SUFFIX};
+#[cfg(test)]
 use crate::models::*;
 
 /// Performs the actual HTTP download with resume support.
@@ -16,9 +17,16 @@ use crate::models::*;
 /// - Streaming response chunks to disk
 /// - Progress tracking and throttling
 /// - State updates and event emission
-pub(crate) async fn download(manager: &DownloadManager, item: DownloadRecord) -> crate::Result<()> {
+pub(crate) async fn download(active: ActiveDownload<'_>) -> crate::Result<()> {
+   download_with_header_hook(active, || {}).await
+}
+
+async fn download_with_header_hook(
+   mut active: ActiveDownload<'_>,
+   before_header_persist: impl FnOnce(),
+) -> crate::Result<()> {
    // Check the size of the already downloaded part, if any.
-   let temp_path = format!("{}{}", item.path, DOWNLOAD_SUFFIX);
+   let temp_path = format!("{}{}", active.path(), DOWNLOAD_SUFFIX);
    let mut downloaded_size = if Path::new(&temp_path).exists() {
       fs::metadata(&temp_path)
          .map(|metadata| metadata.len())
@@ -39,9 +47,9 @@ pub(crate) async fn download(manager: &DownloadManager, item: DownloadRecord) ->
    }
 
    // Send the request.
-   let response = match manager
-      .http_client
-      .get(&item.url)
+   let response = match active
+      .http_client()
+      .get(active.url())
       .headers(headers)
       .send()
       .await
@@ -68,7 +76,7 @@ pub(crate) async fn download(manager: &DownloadManager, item: DownloadRecord) ->
    // Kotlin fallback for transient server-config blips.
    if downloaded_size > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
       tracing::warn!(
-         file = %item.path,
+         file = %active.path(),
          "Range not honored (got 200, not 206); restarting download from zero"
       );
       if Path::new(&temp_path).exists() {
@@ -84,14 +92,12 @@ pub(crate) async fn download(manager: &DownloadManager, item: DownloadRecord) ->
    // Persist a known total immediately. Progress updates deliberately avoid disk
    // writes, but the total must survive an abrupt process exit so init() can
    // combine it with the recovered temp-file length.
-   if let Some(total) = total_size
-      && let Some(current_item) = manager.store.find_by_path(&item.path)?
-      && current_item.status == DownloadStatus::InProgress
-      && current_item.total_bytes != Some(total)
-   {
-      manager
-         .store
-         .update(current_item.with_bytes(downloaded_size, Some(total)))?;
+   if total_size.is_some() {
+      before_header_persist();
+      active = match active.persist_headers(downloaded_size, total_size)? {
+         Active::Active(active) => active,
+         Active::NoLongerActive => return Ok(()),
+      };
    }
 
    // Ensure the output folder exists.
@@ -128,29 +134,11 @@ pub(crate) async fn download(manager: &DownloadManager, item: DownloadRecord) ->
             }
 
             progress.mark_emitted();
-            let Ok(Some(current_item)) = manager.store.find_by_path(&item.path) else {
-               // Download item was not found i.e. removed.
-               return Ok(());
-            };
-            match current_item.status {
-               // Download is in progress.
-               DownloadStatus::InProgress => {
-                  if !progress.is_complete() {
-                     // Download is not yet complete.
-                     // Update item in store and emit change event.
-                     let updated = current_item
-                        .with_bytes(progress.received_bytes, total_size)
-                        .with_status(DownloadStatus::InProgress);
-                     manager.store.update_no_persist(updated.clone())?;
-                     manager.emit_changed(&updated);
-                  }
-                  // Completion is handled after the loop exits naturally.
-               }
-               // Paused: stop, but keep the temp file so the download can resume.
-               DownloadStatus::Paused => return Ok(()),
-               // Canceled/Completed/Idle: stop and leave the temp file. A real cancel
-               // removes the store entry, so it hits the `None` branch above, not here.
-               _ => return Ok(()),
+            if !progress.is_complete() {
+               active = match active.checkpoint(progress.received_bytes, total_size)? {
+                  Active::Active(active) => active,
+                  Active::NoLongerActive => return Ok(()),
+               };
             }
          }
          Err(e) => {
@@ -159,33 +147,9 @@ pub(crate) async fn download(manager: &DownloadManager, item: DownloadRecord) ->
       }
    }
 
-   // Download stream ended naturally — rename temp file to final path and emit completion.
-   if let Ok(Some(current_item)) = manager.store.find_by_path(&item.path)
-      && matches!(current_item.status, DownloadStatus::InProgress)
-   {
-      // Rename before deleting the store entry: if the rename fails, the entry stays
-      // InProgress and the temp file survives, so the caller can revert it to a
-      // resumable state instead of the download silently vanishing.
-
-      // On Windows `fs::rename` fails if the destination exists, so remove it first.
-      // On Unix `fs::rename` replaces atomically — skipping the pre-delete preserves that.
-      #[cfg(windows)]
-      if Path::new(&item.path).exists() {
-         fs::remove_file(&item.path).map_err(|e| {
-            Error::File(format!("Failed to remove existing destination file: {}", e))
-         })?;
-      }
-
-      fs::rename(&temp_path, &item.path)
-         .map_err(|e| Error::File(format!("Failed to rename temp file to destination: {}", e)))?;
-
-      // File is safely in place; now drop the store entry and signal completion.
-      manager.store.delete(&item.path)?;
-      let completed = current_item
-         .with_bytes(progress.received_bytes, total_size)
-         .with_status(DownloadStatus::Completed);
-      manager.emit_changed(&completed);
-   }
+   // Download stream ended naturally. The status check, rename, and store
+   // removal are one synchronized operation.
+   active.finish(&temp_path, progress.received_bytes, total_size)?;
 
    Ok(())
 }
@@ -257,6 +221,10 @@ mod tests {
    use tempfile::TempDir;
    use wiremock::matchers::{header, method, path as wm_path};
    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+   async fn run_download(manager: &DownloadManager, item: DownloadRecord) -> crate::Result<()> {
+      download(ActiveDownload::new(manager, item)).await
+   }
 
    type EventLog = Arc<Mutex<Vec<DownloadItem>>>;
 
@@ -334,7 +302,7 @@ mod tests {
       let url = format!("{}/file", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       // Final file exists with expected bytes; temp file gone.
       assert_eq!(fs::read(&dest).unwrap(), body);
@@ -362,6 +330,48 @@ mod tests {
    }
 
    #[tokio::test]
+   async fn test_pause_before_header_persist_stops_before_writing_body() {
+      let fixture = make_fixture();
+      let server = MockServer::start().await;
+      let body = b"body must not be written".to_vec();
+
+      Mock::given(method("GET"))
+         .and(wm_path("/pause-at-headers"))
+         .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+         .mount(&server)
+         .await;
+
+      let dest = dest_path(&fixture, "pause-at-headers.bin");
+      let url = format!("{}/pause-at-headers", server.uri());
+      let item = seed_in_progress(&fixture.manager, &dest, &url);
+
+      download_with_header_hook(ActiveDownload::new(&fixture.manager, item), || {
+         fixture.manager.pause(&dest).unwrap();
+      })
+      .await
+      .unwrap();
+
+      let stored = fixture.manager.store.find_by_path(&dest).unwrap().unwrap();
+      assert_eq!(stored.status, DownloadStatus::Paused);
+      assert_eq!(stored.received_bytes, 0);
+      assert_eq!(stored.total_bytes, None);
+
+      let reloaded = DownloadStore::new(fixture._dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let persisted = reloaded.find_by_path(&dest).unwrap().unwrap();
+      assert_eq!(persisted.status, DownloadStatus::Paused);
+      assert_eq!(persisted.received_bytes, 0);
+      assert_eq!(persisted.total_bytes, None);
+
+      assert!(!Path::new(&dest).exists());
+      assert!(!Path::new(&format!("{}{}", dest, DOWNLOAD_SUFFIX)).exists());
+      assert_eq!(
+         events_with_status(&fixture.events, DownloadStatus::Completed),
+         0
+      );
+   }
+
+   #[tokio::test]
    async fn test_completes_without_content_length() {
       // Regression: when the server omits Content-Length, total_size is None
       // and progress stays at 0.0. Completion must still trigger when the
@@ -384,7 +394,7 @@ mod tests {
       let url = format!("{}/stream", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       assert_eq!(fs::read(&dest).unwrap(), body);
       assert!(fixture.manager.store.find_by_path(&dest).unwrap().is_none());
@@ -431,7 +441,7 @@ mod tests {
       let url = format!("{}/resume", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       let combined = [first_half.as_slice(), second_half.as_slice()].concat();
       assert_eq!(fs::read(&dest).unwrap(), combined);
@@ -470,7 +480,7 @@ mod tests {
       let url = format!("{}/fallback", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       // Final file is the full body, not partial + full.
       assert_eq!(fs::read(&dest).unwrap(), full_body);
@@ -504,7 +514,7 @@ mod tests {
       let url = format!("{}/missing", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      let err = download(&fixture.manager, item).await.unwrap_err();
+      let err = run_download(&fixture.manager, item).await.unwrap_err();
       match err {
          Error::Http(msg) => assert!(msg.contains("404"), "expected status in message: {}", msg),
          other => panic!("expected Error::Http, got {:?}", other),
@@ -537,7 +547,7 @@ mod tests {
       let url = format!("{}/nested", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       assert_eq!(fs::read(&dest).unwrap(), b"data");
    }
@@ -564,7 +574,7 @@ mod tests {
       let url = format!("{}/big", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       // At least one InProgress event with received_bytes > 0 but total_bytes == None
       // (unknown size), plus the final Completed event.
@@ -637,7 +647,7 @@ mod tests {
       let url = format!("{}/pause", server.uri());
       let item = seed_in_progress(&manager, &dest, &url);
 
-      download(&manager, item).await.unwrap();
+      run_download(&manager, item).await.unwrap();
 
       let temp_path = format!("{}{}", dest, DOWNLOAD_SUFFIX);
       // At least one in-progress event fired before the pause took effect.
@@ -681,7 +691,7 @@ mod tests {
       let url = format!("{}/rename-fail", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      let err = download(&fixture.manager, item).await.unwrap_err();
+      let err = run_download(&fixture.manager, item).await.unwrap_err();
       assert!(
          matches!(err, Error::File(_)),
          "expected Error::File with context, got {:?}",
@@ -740,7 +750,7 @@ mod tests {
       let url = format!("{}/file", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       assert_eq!(
          received_user_agent(&server).await,
@@ -765,7 +775,7 @@ mod tests {
       let url = format!("{}/file", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       assert_eq!(received_user_agent(&server).await, None);
    }
@@ -790,7 +800,7 @@ mod tests {
       let url = format!("{}/file", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       assert_eq!(received_user_agent(&server).await, None);
    }
@@ -819,7 +829,7 @@ mod tests {
       let url = format!("{}/file", server.uri());
       let item = seed_in_progress(&fixture.manager, &dest, &url);
 
-      download(&fixture.manager, item).await.unwrap();
+      run_download(&fixture.manager, item).await.unwrap();
 
       server.verify().await;
    }

@@ -47,13 +47,15 @@ async fn download_with_header_hook(
    }
 
    // Send the request.
-   let response = match active
+   let request = active
       .http_client()
       .get(active.url())
       .headers(headers)
-      .send()
-      .await
-   {
+      .send();
+   let response = match tokio::select! {
+      () = active.cancelled() => return Ok(()),
+      response = request => response,
+   } {
       Ok(res) => res,
       Err(e) => {
          return Err(Error::Http(format!("Failed to send request: {}", e)));
@@ -120,7 +122,12 @@ async fn download_with_header_hook(
    let mut stream = response.bytes_stream();
    let mut progress = ProgressTracker::new(downloaded_size, total_size);
 
-   while let Some(chunk) = stream.next().await {
+   loop {
+      let chunk = tokio::select! {
+         () = active.cancelled() => return Ok(()),
+         chunk = stream.next() => chunk,
+      };
+      let Some(chunk) = chunk else { break };
       match chunk {
          Ok(data) => {
             file

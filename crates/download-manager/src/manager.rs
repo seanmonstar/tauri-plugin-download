@@ -1,8 +1,10 @@
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::Error;
@@ -35,6 +37,26 @@ pub struct DownloadManager {
    pub(crate) store: DownloadStore,
    pub(crate) on_changed: OnChanged,
    connection_status: ConnectionStatusProvider,
+   tasks: TaskRegistry,
+}
+
+/// The desktop equivalent of iOS URLSession tasks and Android unique work.
+/// It contains runtime lifecycle only; persisted download state stays in the store.
+#[derive(Clone, Default)]
+struct TaskRegistry {
+   inner: Arc<Mutex<HashMap<String, Arc<TaskControl>>>>,
+}
+
+struct TaskControl {
+   cancel: watch::Sender<bool>,
+   finished: watch::Receiver<bool>,
+}
+
+struct TaskRegistration {
+   path: String,
+   control: Arc<TaskControl>,
+   registry: TaskRegistry,
+   finished: watch::Sender<bool>,
 }
 
 /// Capabilities available to one running download task.
@@ -44,6 +66,7 @@ pub struct DownloadManager {
 pub(crate) struct ActiveDownload<'a> {
    manager: &'a DownloadManager,
    item: DownloadRecord,
+   cancel: Option<watch::Receiver<bool>>,
 }
 
 /// Outcome of checking whether a download remains active.
@@ -115,6 +138,7 @@ impl DownloadManager {
          store,
          on_changed,
          connection_status,
+         tasks: TaskRegistry::default(),
       }
    }
 
@@ -261,6 +285,7 @@ impl DownloadManager {
       match item.status {
          // Allow download to be started when idle.
          DownloadStatus::Idle => {
+            self.tasks.wait(path).await?;
             self.ensure_network_allowed(&item).await?;
             self.spawn_download(item, DownloadStatus::Idle, "failed to start")
          }
@@ -291,6 +316,7 @@ impl DownloadManager {
       match item.status {
          // Allow download to be resumed when paused.
          DownloadStatus::Paused => {
+            self.tasks.wait(path).await?;
             self.ensure_network_allowed(&item).await?;
             self.spawn_download(item, DownloadStatus::Paused, "failed to resume")
          }
@@ -309,6 +335,18 @@ impl DownloadManager {
       expected_status: DownloadStatus,
       err_msg: &'static str,
    ) -> crate::Result<DownloadActionResponse> {
+      // Reserve the path before changing the persisted state. This closes the
+      // window where pause/cancel could miss a newly starting runtime task.
+      let Some((registration, cancel)) = self.tasks.register(&item.path)? else {
+         let current = self
+            .store
+            .find_by_path(&item.path)?
+            .ok_or_else(|| Error::NotFound(item.path.clone()))?;
+         return Ok(DownloadActionResponse::with_expected_status(
+            current.to_item(),
+            DownloadStatus::InProgress,
+         ));
+      };
       let item_in_progress = match self.store.update_if_status(
          &item.path,
          expected_status,
@@ -316,12 +354,16 @@ impl DownloadManager {
       )? {
          UpdateIfStatusResult::Updated(item) => item,
          UpdateIfStatusResult::Unchanged(current) => {
+            drop(registration);
             return Ok(DownloadActionResponse::with_expected_status(
                current.to_item(),
                DownloadStatus::InProgress,
             ));
          }
-         UpdateIfStatusResult::NotFound => return Err(Error::NotFound(item.path)),
+         UpdateIfStatusResult::NotFound => {
+            drop(registration);
+            return Err(Error::NotFound(item.path));
+         }
       };
 
       let manager = self.clone();
@@ -329,7 +371,8 @@ impl DownloadManager {
       // Build the item without emitting — the download task will emit progress updates.
       let public_item = item_in_progress.to_item();
       tokio::spawn(async move {
-         let active = ActiveDownload::new(&manager, item_in_progress);
+         let _registration = registration;
+         let active = ActiveDownload::with_cancel(&manager, item_in_progress, cancel);
          if let Err(e) = downloader::download(active).await {
             error!(file = %filename(&path), "Download {}: {}", err_msg, e);
 
@@ -341,6 +384,12 @@ impl DownloadManager {
                Ok(None) => {}
                Err(e) => warn!(file = %filename(&path), "Failed to revert download item: {}", e),
             }
+         }
+
+         // cancel() may be unable to unlink an open file on Windows. Once the
+         // downloader has released it, make one final best-effort cleanup.
+         if matches!(manager.store.find_by_path(&path), Ok(None)) {
+            let _ = fs::remove_file(format!("{}{}", path, DOWNLOAD_SUFFIX));
          }
       });
 
@@ -384,6 +433,7 @@ impl DownloadManager {
          .update_if_status(path, DownloadStatus::InProgress, DownloadStatus::Paused)?
       {
          UpdateIfStatusResult::Updated(paused) => {
+            self.tasks.cancel(path)?;
             let event = self.emit_changed(&paused);
             Ok(DownloadActionResponse::new(event))
          }
@@ -415,6 +465,7 @@ impl DownloadManager {
          ],
       )? {
          DeleteIfStatusResult::Deleted(item) => {
+            self.tasks.cancel(path)?;
             let temp_path = format!("{}{}", item.path, DOWNLOAD_SUFFIX);
             if fs::remove_file(&temp_path).is_err() {
                debug!(file = %filename(&item.path), "Temp file was not found or could not be deleted");
@@ -460,8 +511,34 @@ impl DownloadManager {
 
 impl<'a> ActiveDownload<'a> {
    /// Creates a restricted view of `manager` for the running download represented by `item`.
+   #[cfg(test)]
    pub(crate) fn new(manager: &'a DownloadManager, item: DownloadRecord) -> Self {
-      Self { manager, item }
+      Self {
+         manager,
+         item,
+         cancel: None,
+      }
+   }
+
+   fn with_cancel(
+      manager: &'a DownloadManager,
+      item: DownloadRecord,
+      cancel: watch::Receiver<bool>,
+   ) -> Self {
+      Self {
+         manager,
+         item,
+         cancel: Some(cancel),
+      }
+   }
+
+   /// Waits until pause or cancel requests cooperative task shutdown.
+   pub(crate) async fn cancelled(&mut self) {
+      let Some(cancel) = &mut self.cancel else {
+         std::future::pending::<()>().await;
+         return;
+      };
+      while !*cancel.borrow() && cancel.changed().await.is_ok() {}
    }
 
    /// Returns the final destination path for this download.
@@ -561,6 +638,79 @@ impl<'a> ActiveDownload<'a> {
          self.manager.emit_changed(&completed);
       }
       Ok(())
+   }
+}
+
+impl TaskRegistry {
+   fn register(
+      &self,
+      path: &str,
+   ) -> crate::Result<Option<(TaskRegistration, watch::Receiver<bool>)>> {
+      let mut tasks = self
+         .inner
+         .lock()
+         .map_err(|e| Error::Internal(format!("Task registry lock poisoned: {e}")))?;
+      if tasks.contains_key(path) {
+         return Ok(None);
+      }
+
+      let (cancel, cancel_rx) = watch::channel(false);
+      let (finished, finished_rx) = watch::channel(false);
+      let control = Arc::new(TaskControl {
+         cancel,
+         finished: finished_rx,
+      });
+      tasks.insert(path.to_string(), control.clone());
+      Ok(Some((
+         TaskRegistration {
+            path: path.to_string(),
+            control,
+            registry: self.clone(),
+            finished,
+         },
+         cancel_rx,
+      )))
+   }
+
+   fn cancel(&self, path: &str) -> crate::Result<()> {
+      let tasks = self
+         .inner
+         .lock()
+         .map_err(|e| Error::Internal(format!("Task registry lock poisoned: {e}")))?;
+      if let Some(task) = tasks.get(path) {
+         let _ = task.cancel.send(true);
+      }
+      Ok(())
+   }
+
+   async fn wait(&self, path: &str) -> crate::Result<()> {
+      let mut finished = {
+         let tasks = self
+            .inner
+            .lock()
+            .map_err(|e| Error::Internal(format!("Task registry lock poisoned: {e}")))?;
+         tasks.get(path).map(|task| task.finished.clone())
+      };
+      if let Some(finished) = &mut finished {
+         while !*finished.borrow() && finished.changed().await.is_ok() {}
+      }
+      Ok(())
+   }
+}
+
+impl Drop for TaskRegistration {
+   fn drop(&mut self) {
+      let Ok(mut tasks) = self.registry.inner.lock() else {
+         return;
+      };
+      if tasks
+         .get(&self.path)
+         .is_some_and(|current| Arc::ptr_eq(current, &self.control))
+      {
+         tasks.remove(&self.path);
+      }
+      drop(tasks);
+      let _ = self.finished.send(true);
    }
 }
 
@@ -682,6 +832,34 @@ mod tests {
 
    fn clear_events(events: &EventLog) {
       events.lock().unwrap().clear();
+   }
+
+   #[tokio::test]
+   async fn test_task_registry_waits_for_previous_task_to_exit() {
+      let registry = TaskRegistry::default();
+      let (registration, _cancel) = registry.register("/tmp/file.mp4").unwrap().unwrap();
+
+      assert!(
+         tokio::time::timeout(Duration::from_millis(20), registry.wait("/tmp/file.mp4"))
+            .await
+            .is_err()
+      );
+
+      drop(registration);
+      tokio::time::timeout(Duration::from_millis(100), registry.wait("/tmp/file.mp4"))
+         .await
+         .expect("task handoff did not finish")
+         .unwrap();
+   }
+
+   #[test]
+   fn test_task_registry_signals_cancellation() {
+      let registry = TaskRegistry::default();
+      let (_registration, cancel) = registry.register("/tmp/file.mp4").unwrap().unwrap();
+
+      registry.cancel("/tmp/file.mp4").unwrap();
+
+      assert!(*cancel.borrow());
    }
 
    fn seed(manager: &DownloadManager, path: &str, status: DownloadStatus) {
@@ -1461,6 +1639,33 @@ mod tests {
 
       let response = manager.resume(&path).await.unwrap();
 
+      assert_eq!(response.download.status, DownloadStatus::InProgress);
+      wait_for_download(&manager, &path).await;
+      assert_eq!(fs::read(&path).unwrap(), MOCK_BODY);
+      server.verify().await;
+   }
+
+   #[tokio::test]
+   async fn test_resume_waits_for_previous_runtime_task() {
+      let (manager, dir, _events) = make_manager();
+      let (server, path, url) = make_mock_download(&dir).await;
+      seed_with_url_and_options(
+         &manager,
+         &path,
+         &url,
+         DownloadStatus::Paused,
+         CreateOptions::default(),
+      );
+      let (previous_task, _cancel) = manager.tasks.register(&path).unwrap().unwrap();
+
+      let resume_manager = manager.clone();
+      let resume_path = path.clone();
+      let resume = tokio::spawn(async move { resume_manager.resume(&resume_path).await });
+      tokio::time::sleep(Duration::from_millis(20)).await;
+      assert!(!resume.is_finished());
+
+      drop(previous_task);
+      let response = resume.await.unwrap().unwrap();
       assert_eq!(response.download.status, DownloadStatus::InProgress);
       wait_for_download(&manager, &path).await;
       assert_eq!(fs::read(&path).unwrap(), MOCK_BODY);

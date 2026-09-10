@@ -13,6 +13,7 @@ class DownloadManagerTest {
       path = "/tmp/file.mp4",
       receivedBytes = 500L,
       totalBytes = 1000L,
+      validator = ResumeValidator.ETag("\"v1\""),
       status = DownloadStatus.InProgress,
    )
 
@@ -27,6 +28,7 @@ class DownloadManagerTest {
       // over the 500 the last progress tick reported.
       assertEquals(480L, reverted?.receivedBytes)
       assertEquals(1000L, reverted?.totalBytes)
+      assertEquals(ResumeValidator.ETag("\"v1\""), reverted?.validator)
    }
 
    @Test
@@ -36,8 +38,9 @@ class DownloadManagerTest {
       assertEquals(DownloadStatus.Idle, reverted?.status)
       // Nothing to resume from, so the download restarts from scratch.
       assertEquals(0L, reverted?.receivedBytes)
-      // The total came from headers and is still true of the remote file.
+      // Retain the last reported total until a new response replaces it.
       assertEquals(1000L, reverted?.totalBytes)
+      assertNull(reverted?.validator)
    }
 
    @Test

@@ -43,6 +43,12 @@ class DownloadStoreTest {
       assertEquals(500L, decoded.first().receivedBytes)
       assertEquals(1000L, decoded.first().totalBytes)
       assertEquals(DownloadStatus.Paused, decoded.first().status)
+      assertNull(decoded.first().validator)
+      val request = DownloadWorker.requestFor(
+         decoded.first().url, null, 500L, decoded.first().validator,
+      )
+      assertNull(request.header("Range"))
+      assertNull(request.header("If-Range"))
    }
 
    @Test
@@ -80,7 +86,7 @@ class DownloadStoreTest {
 
    @Test
    fun `a record without received bytes fails to decode`() {
-      // Matches the Rust and Swift records: everything but totalBytes is stated.
+      // Byte counts are required even when optional response metadata is absent.
       assertThrows(SerializationException::class.java) {
          DownloadStore.decodeRecords(
             """{"version":1,"downloads":[{"url":"http://example.com/a.mp4","path":"/tmp/a.mp4","options":{"allowMetered":true},"status":"idle"}]}"""
@@ -208,8 +214,8 @@ class DownloadStoreTest {
    @Test
    fun `a record of every default survives the round trip`() {
       // The store's Json leaves encodeDefaults off, so only @Required properties
-      // survive it — the shape production actually writes. totalBytes is the one
-      // field that may legitimately be absent, so it alone is dropped.
+      // survive it — the shape production actually writes. Unknown totalBytes and
+      // a missing validator are omitted.
       val record = DownloadRecord(url = "http://example.com/a.mp4", path = "/tmp/a.mp4")
 
       val encoded = DownloadStore.encodeRecords(listOf(record))
@@ -219,6 +225,7 @@ class DownloadStoreTest {
       assertTrue(encoded.contains(""""receivedBytes":0"""))
       assertTrue(encoded.contains(""""status":"idle"""))
       assertFalse(encoded.contains("totalBytes"))
+      assertFalse(encoded.contains("validator"))
       assertEquals(listOf(record), decoded)
       assertNull(decoded.first().totalBytes)
    }

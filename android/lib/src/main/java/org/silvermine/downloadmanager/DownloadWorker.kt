@@ -29,7 +29,7 @@ import javax.net.ssl.SSLPeerUnverifiedException
  * WorkManager CoroutineWorker that performs the actual HTTP download.
  *
  * Mirrors the Rust downloader.rs pattern:
- * - Supports resume via Range headers
+ * - Supports validated resume via Range and If-Range headers
  * - Writes to a temp file (.download suffix), renames on completion
  * - Throttles progress updates via [ProgressTracker]
  * - Checks store status each progress tick to detect pause/cancel
@@ -84,81 +84,79 @@ internal class DownloadWorker(
          // Check the size of the already downloaded part, if any.
          var downloadedSize = if (tempFile.exists()) tempFile.length() else 0L
 
+         val savedRecord = synchronized(manager) {
+            store.findByPath(path)?.takeIf { it.status == DownloadStatus.InProgress && !isStopped }
+         } ?: return Result.success()
+
          // The user agent comes from the input data rather than the manager: a worker
          // re-run after process death has no loaded plugin to have set it.
          val response = executeWithRetry(
-            requestFor(url, inputData.getString(KEY_USER_AGENT), downloadedSize)
+            requestFor(url, inputData.getString(KEY_USER_AGENT), downloadedSize, savedRecord.validator)
          )
 
          response.use {
-            // If we requested a Range but the server doesn't support partial downloads,
-            // fall back to restarting from zero rather than failing.
-            if (downloadedSize > 0 && response.code != 206) {
-               if (response.isSuccessful) {
-                  Log.w(TAG, "Server does not support Range; restarting download from zero")
-                  if (tempFile.exists()) tempFile.delete()
-                  downloadedSize = 0L
-               } else {
-                  when (partialFileOutcomeFor(response.code, response.header("Content-Range"), downloadedSize)) {
-                     PartialFileOutcome.Complete -> {
-                        // Falls through to the rename below, which completes only an
-                        // InProgress record — a re-run after process death finds it
-                        // reconciled to Paused, as the streaming path does.
-                        Log.i(TAG, "Partial already complete; finishing")
-                        synchronized(manager) {
-                           store.findByPath(path)?.let { store.update(it.withStatus(DownloadStatus.InProgress)) }
-                        }
-                        finalReceivedBytes = downloadedSize
-                        finalTotalBytes = downloadedSize
-                        return@use
-                     }
-                     PartialFileOutcome.Discard -> {
-                        Log.w(TAG, "Range not satisfiable; discarding the unusable partial download")
-                        if (tempFile.exists()) tempFile.delete()
-                        return handleError(manager, store, path, "HTTP ${response.code}: ${response.message}")
-                     }
-                     PartialFileOutcome.KeepPartial -> {
-                        return handleError(manager, store, path, "HTTP ${response.code}: ${response.message}")
-                     }
+            if (downloadedSize > 0 && !response.isSuccessful) {
+               when (partialFileOutcomeFor(response.code, response.header("Content-Range"), downloadedSize)) {
+                  PartialFileOutcome.Complete -> {
+                     // The completion block below still checks that the record is InProgress.
+                     Log.i(TAG, "Partial already complete; finishing")
+                     finalReceivedBytes = downloadedSize
+                     finalTotalBytes = downloadedSize
+                     return@use
+                  }
+                  PartialFileOutcome.Discard -> {
+                     Log.w(TAG, "Range not satisfiable; discarding the unusable partial download")
+                     if (tempFile.exists()) tempFile.delete()
+                     return handleError(manager, store, path, "HTTP ${response.code}: ${response.message}")
+                  }
+                  PartialFileOutcome.KeepPartial -> {
+                     return handleError(manager, store, path, "HTTP ${response.code}: ${response.message}")
                   }
                }
             }
 
-            if (!response.isSuccessful && response.code != 206) {
+            if (!response.isSuccessful) {
                return handleError(manager, store, path, "HTTP ${response.code}: ${response.message}")
             }
-
+            if (response.code == 206 && response.request.header("Range") == null) {
+               return handleError(manager, store, path, "Unsolicited partial response")
+            }
+            // Keep byte offsets in the same representation on every request.
+            if (response.header("Content-Encoding")?.equals("identity", ignoreCase = true) == false) {
+               return handleError(manager, store, path, "Unexpected encoded response")
+            }
             val body = response.body
                ?: return handleError(manager, store, path, "Empty response body")
 
-            val totalSize = totalSizeFor(body.contentLength(), downloadedSize)
+            // Guard replacement and metadata persistence together. Delete the old
+            // bytes before saving a new validator, so an interruption cannot pair
+            // an old prefix with the replacement response's validator.
+            val updated = synchronized(manager) {
+               val record = store.findByPath(path)
+               if (record == null || record.status != DownloadStatus.InProgress || isStopped) {
+                  null
+               } else {
+                  val next = responseRecord(record, response, downloadedSize)
+                  if (response.code != 206 && tempFile.exists() && !tempFile.delete()) {
+                     throw IOException("Failed to delete stale temp file")
+                  }
+                  store.update(next)
+                  next
+               }
+            } ?: run {
+               dismissNotification()
+               return Result.success()
+            }
+            downloadedSize = updated.receivedBytes
+            val totalSize = updated.totalBytes
 
-            // Ensure the output folder exists.
             tempFile.parentFile?.let { parent ->
                if (!parent.exists()) parent.mkdirs()
             }
+            val append = response.code == 206
 
-            // Open the temp file in append mode (or truncate if restarting from zero).
-            val append = downloadedSize > 0
-
-            // The temp file is the authority: a server that ignores the Range header
-            // restarts from zero and the record must follow it down. Synchronized
-            // against pause/cancel; a pause landing first is undone by isStopped below.
-            var effectiveTotal = totalSize
-
-            synchronized(manager) {
-               store.findByPath(path)?.let { record ->
-                  val updated = record.withBytes(downloadedSize, totalSize)
-
-                  effectiveTotal = updated.totalBytes
-                  store.update(updated.withStatus(DownloadStatus.InProgress))
-               }
-            }
-
-            // Falls back to the record's known total: without it an unknown content
-            // length drops the transfer onto the coarse byte cadence and contradicts
-            // the indeterminate flag, which keys off the coalesced emitted total.
-            val progressTracker = ProgressTracker(downloadedSize, effectiveTotal)
+            // Only partial responses can retain the previous representation's total.
+            val progressTracker = ProgressTracker(downloadedSize, totalSize)
 
             FileOutputStream(tempFile, append).use { output ->
                val buffer = ByteArray(BUFFER_SIZE)
@@ -437,19 +435,23 @@ internal class DownloadWorker(
       /**
        * Builds the download request.
        *
-       * A null [userAgent] leaves OkHttp's own default in place; a [downloadedSize]
-       * above zero asks the server to resume from there. Both headers are set here, so
-       * neither can displace the other.
-       *
-       * Built here rather than inline in [doWork], which needs [WorkerParameters] and
-       * so cannot be reached without WorkManager's test artifact.
+       * A null [userAgent] leaves OkHttp's own default in place. A saved body is
+       * resumable only with a usable validator; legacy records request a full body.
+       * Identity encoding keeps local file sizes usable as range offsets.
        */
-      internal fun requestFor(url: String, userAgent: String?, downloadedSize: Long): Request {
-         val builder = Request.Builder().url(url)
+      internal fun requestFor(
+         url: String,
+         userAgent: String?,
+         downloadedSize: Long,
+         validator: ResumeValidator? = null,
+      ): Request {
+         val builder = Request.Builder().url(url).header("Accept-Encoding", "identity")
 
          userAgent?.let { builder.header("User-Agent", it) }
-         if (downloadedSize > 0) {
+         val condition = validator?.ifRange()
+         if (downloadedSize > 0 && condition != null) {
             builder.header("Range", "bytes=$downloadedSize-")
+            builder.header("If-Range", condition)
          }
 
          return builder.build()
@@ -503,6 +505,21 @@ internal class DownloadWorker(
          } else {
             PartialFileOutcome.Discard
          }
+      }
+
+      /** Metadata to persist before streaming; partial responses may omit validators. */
+      internal fun responseRecord(record: DownloadRecord, response: Response, downloadedSize: Long): DownloadRecord {
+         val partial = response.code == 206
+         val received = if (partial) downloadedSize else 0L
+         val length = response.body?.contentLength() ?: -1L
+         val total = totalSizeFor(length, received)
+
+         return record.copy(
+            receivedBytes = received,
+            // A full response replaces even a previously known total.
+            totalBytes = total ?: if (partial) record.totalBytes else null,
+            validator = if (partial) record.validator else ResumeValidator.fromHeaders(response.headers),
+         )
       }
 
       internal const val TAG = "DownloadWorker"

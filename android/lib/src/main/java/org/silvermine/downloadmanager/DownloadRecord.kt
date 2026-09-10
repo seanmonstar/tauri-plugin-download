@@ -31,6 +31,10 @@ internal data class DownloadRecord(
    @SerialName("totalBytes")
    val totalBytes: Long? = null,
 
+   /** Absent on older records, which must restart rather than resume without validation. */
+   @SerialName("validator")
+   val validator: ResumeValidator? = null,
+
    @Required
    @SerialName("status")
    val status: DownloadStatus = DownloadStatus.Idle,

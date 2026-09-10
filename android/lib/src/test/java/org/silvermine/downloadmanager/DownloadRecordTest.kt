@@ -104,6 +104,17 @@ class DownloadRecordTest {
    // -- Serialization --
 
    @Test
+   fun `validator stays internal to the persisted record`() {
+      val record = sampleRecord().copy(validator = ResumeValidator.ETag("\"v1\""))
+      val stored = defaultJson.encodeToString(DownloadRecord.serializer(), record)
+      val emitted = defaultJson.encodeToString(DownloadItem.serializer(), record.toItem())
+
+      assertTrue(stored.contains("\"validator\""))
+      assertFalse(emitted.contains("validator"))
+      assertFalse(emitted.contains("v1"))
+   }
+
+   @Test
    fun `item serializes totalBytes as explicit null`() {
       // The key is always present, so the payload matches the frontend contract
       // without relying on the TypeScript layer to coalesce a missing key.

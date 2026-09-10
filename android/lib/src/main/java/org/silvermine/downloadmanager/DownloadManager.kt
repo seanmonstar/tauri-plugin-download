@@ -321,7 +321,7 @@ class DownloadManager private constructor(context: Context, private val storeDir
          return if (tempFileLength != null) {
             record.withBytes(tempFileLength).withStatus(DownloadStatus.Paused)
          } else {
-            record.withBytes(0L).withStatus(DownloadStatus.Idle)
+            record.copy(receivedBytes = 0L, validator = null).withStatus(DownloadStatus.Idle)
          }
       }
 

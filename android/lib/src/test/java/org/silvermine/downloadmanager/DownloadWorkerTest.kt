@@ -1,5 +1,12 @@
 package org.silvermine.downloadmanager
 
+import okhttp3.Headers
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -62,19 +69,132 @@ class DownloadWorkerTest {
    fun `a fresh download sends no range header`() {
       // The common path, and the boundary of the resume condition: without this,
       // widening `downloadedSize > 0` to `>= 0` changes no test outcome.
-      val request = DownloadWorker.requestFor("https://example.com/f.bin", "my-app/1.0", 0L)
+      val request = DownloadWorker.requestFor(
+         "https://example.com/f.bin", "my-app/1.0", 0L, ResumeValidator.ETag("\"v1\""),
+      )
 
       assertNull(request.header("Range"))
+      assertNull(request.header("If-Range"))
    }
 
    @Test
    fun `the user agent and range headers coexist on a resume`() {
       // Mirrors the Rust test_user_agent_and_range_header_are_both_sent_on_resume:
       // neither header may displace the other.
-      val request = DownloadWorker.requestFor("https://example.com/f.bin", "my-app/1.0", 4L)
+      val request = DownloadWorker.requestFor(
+         "https://example.com/f.bin", "my-app/1.0", 4L, ResumeValidator.ETag("\"v1\""),
+      )
 
       assertEquals("my-app/1.0", request.header("User-Agent"))
       assertEquals("bytes=4-", request.header("Range"))
+      assertEquals("\"v1\"", request.header("If-Range"))
+   }
+
+   @Test
+   fun `a partial file without a usable validator requests a full body`() {
+      for (validator in listOf(null, ResumeValidator.ETag("W/\"v1\""), ResumeValidator.ETag("invalid"))) {
+         val request = DownloadWorker.requestFor("https://example.com/f.bin", null, 4L, validator)
+
+         assertNull(request.header("Range"))
+         assertNull(request.header("If-Range"))
+      }
+   }
+
+   @Test
+   fun `fresh and resumed requests use identity encoding`() {
+      for (size in listOf(0L, 4L)) {
+         val request = DownloadWorker.requestFor(
+            "https://example.com/f.bin", null, size, ResumeValidator.ETag("\"v1\""),
+         )
+         assertEquals("identity", request.header("Accept-Encoding"))
+      }
+   }
+
+   private fun partialRecord(): DownloadRecord = DownloadRecord(
+      url = "https://example.com/f.bin",
+      path = "/tmp/f.bin",
+      receivedBytes = 3L,
+      totalBytes = 10L,
+      validator = ResumeValidator.ETag("\"old\""),
+      status = DownloadStatus.InProgress,
+   )
+
+   private fun response(code: Int, headers: Headers = Headers.Builder().build(), unknownLength: Boolean = false): Response {
+      val body = if (unknownLength) object : ResponseBody() {
+         private val buffer = Buffer().writeUtf8("abcdef")
+         override fun contentType() = null
+         override fun contentLength() = -1L
+         override fun source() = buffer
+      } else "abcdef".toResponseBody()
+
+      return Response.Builder()
+         .request(Request.Builder().url("https://example.com/f.bin").build())
+         .protocol(Protocol.HTTP_1_1)
+         .code(code)
+         .message("test response")
+         .headers(headers)
+         .body(body)
+         .build()
+   }
+
+   private fun reload(record: DownloadRecord): DownloadRecord =
+      DownloadStore.decodeRecords(DownloadStore.encodeRecords(listOf(record))).single()
+
+   @Test
+   fun `partial responses retain the validator and use actual file size`() {
+      for (unknownLength in listOf(false, true)) {
+         response(206, unknownLength = unknownLength).use { response ->
+            val saved = reload(DownloadWorker.responseRecord(partialRecord(), response, 4L))
+            val request = DownloadWorker.requestFor(saved.url, null, saved.receivedBytes, saved.validator)
+
+            assertEquals(4L, saved.receivedBytes)
+            assertEquals(10L, saved.totalBytes)
+            assertEquals("bytes=4-", request.header("Range"))
+            assertEquals("\"old\"", request.header("If-Range"))
+         }
+      }
+   }
+
+   @Test
+   fun `full replacement saves new validator before a subsequent resume`() {
+      for (validator in listOf<ResumeValidator>(
+         ResumeValidator.ETag("\"new\""),
+         ResumeValidator.LastModified(1445412480000L),
+      )) {
+         val headers = when (validator) {
+            is ResumeValidator.ETag -> Headers.headersOf("ETag", validator.value)
+            is ResumeValidator.LastModified -> Headers.headersOf(
+               "Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT",
+               "Date", "Wed, 21 Oct 2015 07:29:00 GMT",
+            )
+         }
+         response(200, headers, unknownLength = true).use { response ->
+            val updated = DownloadWorker.responseRecord(partialRecord(), response, 4L)
+            assertEquals(0L, updated.receivedBytes)
+            assertNull(updated.totalBytes)
+
+            val saved = reload(updated.withBytes(2L).withStatus(DownloadStatus.Paused))
+            val request = DownloadWorker.requestFor(saved.url, null, 2L, saved.validator)
+            assertEquals(validator, saved.validator)
+            assertEquals("bytes=2-", request.header("Range"))
+            assertEquals(validator.ifRange(), request.header("If-Range"))
+         }
+      }
+   }
+
+   @Test
+   fun `full response without validator clears the old one`() {
+      response(200).use { response ->
+         val updated = DownloadWorker.responseRecord(partialRecord(), response, 4L)
+         assertEquals(0L, updated.receivedBytes)
+         assertEquals(6L, updated.totalBytes)
+
+         val saved = reload(updated.withBytes(2L).withStatus(DownloadStatus.Paused))
+         val request = DownloadWorker.requestFor(saved.url, null, 2L, saved.validator)
+         assertNull(saved.validator)
+         assertNull(request.header("Range"))
+         assertNull(request.header("If-Range"))
+      }
    }
 
    // -- Total size --

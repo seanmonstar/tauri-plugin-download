@@ -108,6 +108,8 @@ internal class DownloadStore(directory: File) {
       } catch (e: Exception) {
          file.failWrite(stream)
          Log.e(TAG, "Failed to save download store: ${e.message}")
+         // A worker must not write bytes whose validator was not saved to disk.
+         throw e
       }
    }
 

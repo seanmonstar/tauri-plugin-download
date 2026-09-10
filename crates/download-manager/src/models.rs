@@ -32,6 +32,8 @@ pub(crate) struct DownloadRecord {
    pub options: CreateOptions,
    pub received_bytes: u64,
    pub total_bytes: Option<u64>,
+   /// Validator identifying the representation in the temporary file.
+   pub validator: Option<crate::validator::ResumeValidator>,
    pub status: DownloadStatus,
 }
 
@@ -166,6 +168,7 @@ mod tests {
          options: CreateOptions::default(),
          received_bytes: 0,
          total_bytes: None,
+         validator: None,
          status: DownloadStatus::Idle,
       }
    }
@@ -215,10 +218,19 @@ mod tests {
    fn test_to_item_with_known_size() {
       let mut record = sample_record();
       record.options.allow_metered = false;
+      record.validator = Some(crate::validator::ResumeValidator::ETag(
+         "\"version\"".into(),
+      ));
       record.received_bytes = 500;
       record.total_bytes = Some(1000);
       let item = record.to_item();
       assert!(!item.options.allow_metered);
+      assert!(
+         serde_json::to_value(&item)
+            .unwrap()
+            .get("validator")
+            .is_none()
+      );
       assert_eq!(item.progress, 50.0);
       assert_eq!(item.received_bytes, 500);
       assert_eq!(item.total_bytes, Some(1000));
@@ -253,6 +265,7 @@ mod tests {
       let record: DownloadRecord = serde_json::from_str(json).unwrap();
       assert_eq!(record.received_bytes, 500);
       assert_eq!(record.total_bytes, Some(1000));
+      assert_eq!(record.validator, None);
       // progress is derived via to_item(), not stored
       assert_eq!(record.to_item().progress, 50.0);
    }

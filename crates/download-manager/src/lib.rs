@@ -4,6 +4,7 @@ mod manager;
 mod models;
 mod store;
 mod validate;
+mod validator;
 
 pub use error::{Error, Result};
 pub use manager::{DownloadManager, DownloadManagerConfig, OnChanged};

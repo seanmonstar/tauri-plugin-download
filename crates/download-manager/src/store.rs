@@ -59,14 +59,6 @@ pub(crate) enum DeleteIfStatusResult {
    NotFound,
 }
 
-/// Controls whether a store mutation is limited to memory or also written to disk.
-pub(crate) enum PersistMode {
-   /// Update only the in-memory record.
-   InMemoryOnly,
-   /// Persist the updated record to disk.
-   ToDisk,
-}
-
 /// Thread-safe JSON file store for download records, mirroring iOS `DownloadStore`.
 #[derive(Clone, Debug)]
 pub struct DownloadStore {
@@ -206,7 +198,6 @@ impl DownloadStore {
       path: &str,
       received_bytes: u64,
       total_bytes: Option<u64>,
-      persist_mode: PersistMode,
    ) -> crate::Result<Option<DownloadRecord>> {
       let Some((mut inner, index)) = self.lock_active(path)? else {
          return Ok(None);
@@ -215,10 +206,36 @@ impl DownloadStore {
       inner.downloads[index].received_bytes = received_bytes;
       inner.downloads[index].total_bytes = total_bytes;
       let updated = inner.downloads[index].clone();
-      if matches!(persist_mode, PersistMode::ToDisk) {
+      Ok(Some(updated))
+   }
+
+   /// Saves response metadata before any body bytes are written. The preparation
+   /// callback runs under the status lock and must not re-enter the store.
+   pub(crate) fn update_active_headers(
+      &self,
+      path: &str,
+      received_bytes: u64,
+      total_bytes: Option<u64>,
+      validator: Option<crate::validator::ResumeValidator>,
+      prepare: impl FnOnce() -> crate::Result<()>,
+   ) -> crate::Result<Option<DownloadRecord>> {
+      let Some((mut inner, index)) = self.lock_active(path)? else {
+         return Ok(None);
+      };
+      // Remove the old body before associating the new validator with this path.
+      // A crash in between leaves no partial body to resume with stale metadata.
+      prepare()?;
+      let previous = &inner.downloads[index];
+      let changed = (received_bytes == 0 && previous.received_bytes != 0)
+         || previous.total_bytes != total_bytes
+         || previous.validator != validator;
+      inner.downloads[index].received_bytes = received_bytes;
+      inner.downloads[index].total_bytes = total_bytes;
+      inner.downloads[index].validator = validator;
+      if changed {
          save_inner(&inner)?;
       }
-      Ok(Some(updated))
+      Ok(Some(inner.downloads[index].clone()))
    }
 
    /// Publishes and removes a completed download only while it is still active.
@@ -259,6 +276,9 @@ impl DownloadStore {
       };
 
       inner.downloads[index].received_bytes = received_bytes;
+      if status == DownloadStatus::Idle {
+         inner.downloads[index].validator = None;
+      }
       inner.downloads[index].status = status;
       let reverted = inner.downloads[index].clone();
       save_inner(&inner)?;
@@ -402,6 +422,7 @@ mod tests {
          options: Default::default(),
          received_bytes: 0,
          total_bytes: None,
+         validator: None,
          status: DownloadStatus::Idle,
       }
    }
@@ -602,7 +623,7 @@ mod tests {
          .unwrap();
 
       let updated = store
-         .update_active_bytes("/tmp/file.mp4", 500, Some(1000), PersistMode::InMemoryOnly)
+         .update_active_bytes("/tmp/file.mp4", 500, Some(1000))
          .unwrap();
 
       assert!(updated.is_none());
@@ -613,7 +634,7 @@ mod tests {
    }
 
    #[test]
-   fn test_persist_active_bytes_does_not_overwrite_pause() {
+   fn test_update_active_headers_does_not_overwrite_pause() {
       let (store, dir) = temp_store();
       let active = sample_record("/tmp/file.mp4").with_status(DownloadStatus::InProgress);
       store.create(active.clone()).unwrap();
@@ -622,7 +643,7 @@ mod tests {
          .unwrap();
 
       let updated = store
-         .update_active_bytes("/tmp/file.mp4", 500, Some(1000), PersistMode::ToDisk)
+         .update_active_headers("/tmp/file.mp4", 500, Some(1000), None, || Ok(()))
          .unwrap();
 
       assert!(updated.is_none());
@@ -710,9 +731,7 @@ mod tests {
       store
          .create(sample_record(path).with_status(DownloadStatus::InProgress))
          .unwrap();
-      store
-         .update_active_bytes(path, 100, Some(1000), PersistMode::InMemoryOnly)
-         .unwrap();
+      store.update_active_bytes(path, 100, Some(1000)).unwrap();
 
       let reverted = store
          .revert_active(path, 150, DownloadStatus::Paused)

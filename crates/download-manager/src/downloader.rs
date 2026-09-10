@@ -1,5 +1,6 @@
 use futures::StreamExt;
-use reqwest::header::{CONTENT_RANGE, HeaderMap, RANGE};
+use headers::{HeaderMapExt, Range};
+use reqwest::header::{CONTENT_RANGE, HeaderMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -8,6 +9,7 @@ use crate::Error;
 use crate::manager::{Active, ActiveDownload, DOWNLOAD_SUFFIX};
 #[cfg(test)]
 use crate::models::*;
+use crate::validator::ResumeValidator;
 
 /// Performs the actual HTTP download with resume support.
 ///
@@ -27,23 +29,22 @@ async fn download_with_header_hook(
 ) -> crate::Result<()> {
    // Check the size of the already downloaded part, if any.
    let temp_path = format!("{}{}", active.path(), DOWNLOAD_SUFFIX);
-   let mut downloaded_size = if Path::new(&temp_path).exists() {
-      fs::metadata(&temp_path)
-         .map(|metadata| metadata.len())
-         .unwrap_or(0)
-   } else {
-      0
+   let mut downloaded_size = match fs::metadata(&temp_path) {
+      Ok(metadata) => metadata.len(),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+      Err(e) => return Err(Error::File(format!("Failed to inspect temp file: {}", e))),
    };
 
-   // Set the Range header for resuming the download.
+   // A partial body without a usable validator cannot safely be appended to.
+   let condition = active
+      .validator()
+      .and_then(ResumeValidator::if_range)
+      .filter(|_| downloaded_size > 0);
+   let resuming = condition.is_some();
    let mut headers = HeaderMap::new();
-   if downloaded_size > 0 {
-      headers.insert(
-         RANGE,
-         format!("bytes={}-", downloaded_size)
-            .parse()
-            .map_err(|e| Error::Http(format!("Invalid range header: {}", e)))?,
-      );
+   if let Some(condition) = condition {
+      headers.typed_insert(Range::bytes(downloaded_size..).expect("valid byte offset"));
+      headers.typed_insert(condition);
    }
 
    // Race shutdown against the request so pause/resume cannot be held up by a
@@ -100,35 +101,39 @@ async fn download_with_header_hook(
       )));
    }
 
-   // A 200 (rather than 206) response to a Range request means the server didn't
-   // honor the range for this request, so resuming isn't possible. Discard the
-   // existing temp file and restart from zero rather than failing — mirrors the
-   // Kotlin fallback for transient server-config blips.
-   if downloaded_size > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
-      tracing::warn!(
-         file = %active.path(),
-         "Range not honored (got 200, not 206); restarting download from zero"
-      );
-      if Path::new(&temp_path).exists() {
+   let partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
+   if partial && !resuming {
+      return Err(Error::Http(
+         "Unsolicited partial response to a full download request".into(),
+      ));
+   }
+   // A full 200 response means the range was ignored or its validator no longer
+   // matches. Replace the saved prefix rather than combining representations.
+   let replace_temp = downloaded_size > 0 && !partial;
+   if replace_temp {
+      tracing::warn!(file = %active.path(), "Replacing saved body with a full response");
+      downloaded_size = 0;
+   }
+   // A successful conditional range response may omit representation headers.
+   // Keep the original validator, which identifies the already saved prefix.
+   let validator = if partial {
+      active.validator().cloned()
+   } else {
+      ResumeValidator::from_headers(response.headers())
+   };
+   let total_size = response.content_length().map(|len| len + downloaded_size);
+
+   before_header_persist();
+   active = match active.persist_headers(downloaded_size, total_size, validator, || {
+      if replace_temp {
          fs::remove_file(&temp_path)
             .map_err(|e| Error::File(format!("Failed to delete stale temp file: {}", e)))?;
       }
-      downloaded_size = 0;
-   }
-
-   // Get the total size of the file from headers (if available).
-   let total_size = response.content_length().map(|len| len + downloaded_size);
-
-   // Persist a known total immediately. Progress updates deliberately avoid disk
-   // writes, but the total must survive an abrupt process exit so init() can
-   // combine it with the recovered temp-file length.
-   if total_size.is_some() {
-      before_header_persist();
-      active = match active.persist_headers(downloaded_size, total_size)? {
-         Active::Active(active) => active,
-         Active::NoLongerActive => return Ok(()),
-      };
-   }
+      Ok(())
+   })? {
+      Active::Active(active) => active,
+      Active::NoLongerActive => return Ok(()),
+   };
 
    // Ensure the output folder exists.
    let folder = Path::new(&temp_path)
@@ -305,6 +310,7 @@ mod tests {
          options: CreateOptions::default(),
          received_bytes: 0,
          total_bytes: None,
+         validator: None,
          status: DownloadStatus::InProgress,
       };
       manager.store.create(item.clone()).unwrap();
@@ -460,6 +466,67 @@ mod tests {
    }
 
    #[tokio::test]
+   async fn test_resume_without_usable_validator_requests_full_body() {
+      for validator in [None, Some(ResumeValidator::ETag("W/\"old\"".into()))] {
+         let fixture = make_fixture();
+         let server = MockServer::start().await;
+         Mock::given(method("GET"))
+            .and(|request: &wiremock::Request| {
+               !request.headers.contains_key("range") && !request.headers.contains_key("if-range")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"new body".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+         let dest = dest_path(&fixture, "legacy.bin");
+         fs::write(format!("{}{}", dest, DOWNLOAD_SUFFIX), b"old prefix").unwrap();
+         let mut item = seed_in_progress(&fixture.manager, &dest, &server.uri());
+         item.validator = validator;
+         fixture.manager.store.update(item.clone()).unwrap();
+         run_download(&fixture.manager, item).await.unwrap();
+         assert_eq!(fs::read(&dest).unwrap(), b"new body");
+      }
+   }
+
+   #[tokio::test]
+   async fn test_resume_with_saved_last_modified() {
+      let fixture = make_fixture();
+      let server = MockServer::start().await;
+      let mut response_headers = HeaderMap::new();
+      response_headers.insert(
+         "last-modified",
+         "Tue, 15 Nov 1994 12:45:26 GMT".parse().unwrap(),
+      );
+      response_headers.insert("date", "Tue, 15 Nov 1994 12:46:26 GMT".parse().unwrap());
+      Mock::given(method("GET"))
+         .and(header("range", "bytes=4-"))
+         .and(|request: &wiremock::Request| {
+            request
+               .headers
+               .get("if-range")
+               .is_some_and(|value| value == "Tue, 15 Nov 1994 12:45:26 GMT")
+         })
+         .respond_with(ResponseTemplate::new(206).set_body_bytes(b"rest".to_vec()))
+         .expect(1)
+         .mount(&server)
+         .await;
+      let dest = dest_path(&fixture, "dated.bin");
+      fs::write(format!("{}{}", dest, DOWNLOAD_SUFFIX), b"part").unwrap();
+      let mut item = seed_in_progress(&fixture.manager, &dest, &server.uri());
+      item.validator = ResumeValidator::from_headers(&response_headers);
+      fixture.manager.store.update(item).unwrap();
+      let reloaded = DownloadStore::new(fixture._dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      run_download(
+         &fixture.manager,
+         reloaded.find_by_path(&dest).unwrap().unwrap(),
+      )
+      .await
+      .unwrap();
+      assert_eq!(fs::read(&dest).unwrap(), b"partrest");
+   }
+
+   #[tokio::test]
    async fn test_resume_appends_to_temp_file() {
       let fixture = make_fixture();
       let server = MockServer::start().await;
@@ -483,7 +550,9 @@ mod tests {
          .await;
 
       let url = format!("{}/resume", server.uri());
-      let item = seed_in_progress(&fixture.manager, &dest, &url);
+      let mut item = seed_in_progress(&fixture.manager, &dest, &url);
+      item.validator = Some(ResumeValidator::ETag("\"original\"".into()));
+      fixture.manager.store.update(item.clone()).unwrap();
 
       run_download(&fixture.manager, item).await.unwrap();
 
@@ -517,12 +586,19 @@ mod tests {
       let full_body = b"full body content";
       Mock::given(method("GET"))
          .and(wm_path("/fallback"))
-         .respond_with(ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()))
+         .and(header("if-range", "\"original\""))
+         .respond_with(
+            ResponseTemplate::new(200)
+               .insert_header("etag", "\"updated\"")
+               .set_body_bytes(full_body.to_vec()),
+         )
          .mount(&server)
          .await;
 
       let url = format!("{}/fallback", server.uri());
-      let item = seed_in_progress(&fixture.manager, &dest, &url);
+      let mut item = seed_in_progress(&fixture.manager, &dest, &url);
+      item.validator = Some(ResumeValidator::ETag("\"original\"".into()));
+      fixture.manager.store.update(item.clone()).unwrap();
 
       run_download(&fixture.manager, item).await.unwrap();
 
@@ -553,16 +629,22 @@ mod tests {
 
       let dest = dest_path(&fixture, "stale.bin");
       let temp_path = format!("{}{}", dest, DOWNLOAD_SUFFIX);
-      fs::write(&temp_path, b"bytes past the end of a shrunken resource").unwrap();
+      let body = b"bytes past the end of a shrunken resource";
+      fs::write(&temp_path, body).unwrap();
 
       Mock::given(method("GET"))
          .and(wm_path("/stale"))
+         .and(header("Range", format!("bytes={}-", body.len())))
+         .and(header("If-Range", "\"original\""))
          .respond_with(ResponseTemplate::new(416))
+         .expect(1)
          .mount(&server)
          .await;
 
       let url = format!("{}/stale", server.uri());
-      let item = seed_in_progress(&fixture.manager, &dest, &url);
+      let mut item = seed_in_progress(&fixture.manager, &dest, &url);
+      item.validator = Some(ResumeValidator::ETag("\"original\"".into()));
+      fixture.manager.store.update(item.clone()).unwrap();
 
       assert!(run_download(&fixture.manager, item).await.is_err());
 
@@ -584,15 +666,20 @@ mod tests {
 
       Mock::given(method("GET"))
          .and(wm_path("/complete"))
+         .and(header("Range", format!("bytes={}-", body.len())))
+         .and(header("If-Range", "\"original\""))
          .respond_with(
             ResponseTemplate::new(416)
                .append_header("Content-Range", format!("bytes */{}", body.len())),
          )
+         .expect(1)
          .mount(&server)
          .await;
 
       let url = format!("{}/complete", server.uri());
-      let item = seed_in_progress(&fixture.manager, &dest, &url);
+      let mut item = seed_in_progress(&fixture.manager, &dest, &url);
+      item.validator = Some(ResumeValidator::ETag("\"original\"".into()));
+      fixture.manager.store.update(item.clone()).unwrap();
 
       run_download(&fixture.manager, item).await.unwrap();
 
@@ -782,6 +869,7 @@ mod tests {
          .and(wm_path("/pause"))
          .respond_with(
             ResponseTemplate::new(200)
+               .insert_header("etag", "\"original\"")
                .set_body_bytes(body.clone())
                .append_header("Transfer-Encoding", "chunked"),
          )
@@ -793,6 +881,14 @@ mod tests {
       let item = seed_in_progress(&manager, &dest, &url);
 
       run_download(&manager, item).await.unwrap();
+      let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+      reloaded.load().unwrap();
+      let saved = reloaded.find_by_path(&dest).unwrap().unwrap();
+      assert_eq!(saved.total_bytes, None);
+      assert_eq!(
+         saved.validator,
+         Some(ResumeValidator::ETag("\"original\"".into()))
+      );
 
       let temp_path = format!("{}{}", dest, DOWNLOAD_SUFFIX);
       // At least one in-progress event fired before the pause took effect.
@@ -812,6 +908,141 @@ mod tests {
       // No completion was emitted and the store entry survives for resume.
       assert_eq!(events_with_status(&events, DownloadStatus::Completed), 0);
       assert!(manager.store.find_by_path(&dest).unwrap().is_some());
+   }
+
+   /// Interrupt a real response, recreate the manager from disk, and finish the
+   /// download. An optional old prefix makes the first response a replacement.
+   async fn assert_validator_survives_interrupted_response(
+      replacing: bool,
+      response_etag: Option<&str>,
+   ) {
+      let dir = TempDir::new().unwrap();
+      let store_cell: Arc<Mutex<Option<DownloadStore>>> = Arc::new(Mutex::new(None));
+      let cell = store_cell.clone();
+      let on_changed: OnChanged = Arc::new(move |event| {
+         if event.status == DownloadStatus::InProgress && event.received_bytes > 0 {
+            let guard = cell.lock().unwrap();
+            let store = guard.as_ref().unwrap();
+            let item = store.find_by_path(&event.path).unwrap().unwrap();
+            store
+               .update(item.with_status(DownloadStatus::Paused))
+               .unwrap();
+         }
+      });
+      let manager = DownloadManager::new(
+         dir.path().to_path_buf(),
+         on_changed,
+         DownloadManagerConfig::default(),
+      );
+      *store_cell.lock().unwrap() = Some(manager.store.clone());
+      let server = MockServer::start().await;
+      // Unknown length forces checkpoints by byte count. Vary the bytes so the
+      // final comparison detects a wrong offset as well as an old file prefix.
+      let body: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+      let mut response = ResponseTemplate::new(200)
+         .set_body_bytes(body.clone())
+         .insert_header("Transfer-Encoding", "chunked");
+      if let Some(etag) = response_etag {
+         response = response.insert_header("etag", etag);
+      }
+      Mock::given(method("GET"))
+         .and(move |request: &wiremock::Request| {
+            if replacing {
+               request
+                  .headers
+                  .get("range")
+                  .is_some_and(|v| v == "bytes=4-")
+                  && request
+                     .headers
+                     .get("if-range")
+                     .is_some_and(|v| v == "\"old\"")
+            } else {
+               !request.headers.contains_key("range") && !request.headers.contains_key("if-range")
+            }
+         })
+         .respond_with(response)
+         .expect(1)
+         .mount(&server)
+         .await;
+      let dest = dir
+         .path()
+         .join("lifecycle.bin")
+         .to_string_lossy()
+         .into_owned();
+      let temp_path = format!("{}{}", dest, DOWNLOAD_SUFFIX);
+      let mut item = seed_in_progress(&manager, &dest, &server.uri());
+      if replacing {
+         fs::write(&temp_path, b"old!").unwrap();
+         item.validator = Some(ResumeValidator::ETag("\"old\"".into()));
+         item.received_bytes = 4;
+         manager.store.update(item.clone()).unwrap();
+      }
+      run_download(&manager, item).await.unwrap();
+      let prefix = fs::read(&temp_path).unwrap();
+      assert!(!prefix.is_empty() && prefix.len() < body.len());
+      assert_eq!(prefix, body[..prefix.len()]);
+      assert!(!Path::new(&dest).exists());
+      server.verify().await;
+      server.reset().await;
+      *store_cell.lock().unwrap() = None;
+      drop(manager);
+
+      let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+      let captured = events.clone();
+      let reloaded = DownloadManager::new(
+         dir.path().to_path_buf(),
+         Arc::new(move |event| captured.lock().unwrap().push(event)),
+         DownloadManagerConfig::default(),
+      );
+      let saved = reloaded.store.find_by_path(&dest).unwrap().unwrap();
+      assert_eq!(saved.status, DownloadStatus::Paused);
+      // Persisted progress can lag the file while shutdown completes; the next
+      // Range request must use the actual file length, checked below.
+      assert!(saved.received_bytes > 0 && saved.received_bytes <= prefix.len() as u64);
+      assert_eq!(
+         saved.validator,
+         response_etag.map(|v| ResumeValidator::ETag(v.into()))
+      );
+      let offset = prefix.len();
+      let expected_etag = response_etag.map(str::to_owned);
+      Mock::given(method("GET"))
+         .and(move |request: &wiremock::Request| {
+            match &expected_etag {
+               Some(etag) => {
+                  request.headers.get("range").is_some_and(|v| v == format!("bytes={offset}-").as_str())
+                     && request.headers.get("if-range").is_some_and(|v| v == etag.as_str())
+               }
+               None => !request.headers.contains_key("range") && !request.headers.contains_key("if-range"),
+            }
+         })
+         // A 206 may omit ETag; the saved validator must remain usable.
+         .respond_with(if response_etag.is_some() {
+            ResponseTemplate::new(206).set_body_bytes(body[offset..].to_vec())
+         } else {
+            ResponseTemplate::new(200).set_body_bytes(body.clone())
+         })
+         .expect(1).mount(&server).await;
+      // Use the downloader harness to avoid depending on host connectivity policy.
+      let active = saved.with_status(DownloadStatus::InProgress);
+      reloaded.store.update(active.clone()).unwrap();
+      run_download(&reloaded, active).await.unwrap();
+      assert_eq!(fs::read(&dest).unwrap(), body);
+      assert!(!Path::new(&temp_path).exists());
+      assert!(reloaded.store.find_by_path(&dest).unwrap().is_none());
+      assert_eq!(events_with_status(&events, DownloadStatus::Completed), 1);
+      server.verify().await;
+   }
+
+   #[tokio::test]
+   async fn test_etag_download_pause_reload_resume() {
+      assert_validator_survives_interrupted_response(false, Some("\"original\"")).await;
+   }
+
+   #[tokio::test]
+   async fn test_replacement_pause_reload_uses_replacement_validator() {
+      for etag in [Some("\"new\""), None] {
+         assert_validator_survives_interrupted_response(true, etag).await;
+      }
    }
 
    #[tokio::test]
@@ -962,6 +1193,7 @@ mod tests {
       Mock::given(method("GET"))
          .and(wm_path("/file"))
          .and(header("Range", "bytes=4-"))
+         .and(header("If-Range", "\"original\""))
          .and(header("user-agent", "my-app/1.0"))
          .respond_with(ResponseTemplate::new(206).set_body_bytes(b"rest".to_vec()))
          .expect(1)
@@ -972,7 +1204,9 @@ mod tests {
       fs::write(format!("{}{}", dest, DOWNLOAD_SUFFIX), b"part").unwrap();
 
       let url = format!("{}/file", server.uri());
-      let item = seed_in_progress(&fixture.manager, &dest, &url);
+      let mut item = seed_in_progress(&fixture.manager, &dest, &url);
+      item.validator = Some(ResumeValidator::ETag("\"original\"".into()));
+      fixture.manager.store.update(item.clone()).unwrap();
 
       run_download(&fixture.manager, item).await.unwrap();
 

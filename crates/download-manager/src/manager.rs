@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::Error;
 use crate::downloader;
 use crate::models::*;
-use crate::store::{DeleteIfStatusResult, DownloadStore, PersistMode, UpdateIfStatusResult};
+use crate::store::{DeleteIfStatusResult, DownloadStore, UpdateIfStatusResult};
 use crate::validate;
 
 type HttpClient = reqwest_middleware::ClientWithMiddleware;
@@ -263,6 +263,7 @@ impl DownloadManager {
          options,
          received_bytes: 0,
          total_bytes: None,
+         validator: None,
          status: DownloadStatus::Idle,
       })?;
 
@@ -587,13 +588,17 @@ impl<'a> ActiveDownload<'a> {
       &self.item.url
    }
 
+   pub(crate) fn validator(&self) -> Option<&crate::validator::ResumeValidator> {
+      self.item.validator.as_ref()
+   }
+
    /// Returns the shared HTTP client used to fetch this download.
    pub(crate) fn http_client(&self) -> &HttpClient {
       &self.manager.http_client
    }
 
    /// Updates header-derived byte counts if the download is still in progress.
-   /// The record is persisted only when the known total changes.
+   /// Persists changed byte counts and validators before preparing to stream.
    ///
    /// Returns [`Active::Active`] when the record was updated, or
    /// [`Active::NoLongerActive`] when an external action has already paused,
@@ -602,17 +607,15 @@ impl<'a> ActiveDownload<'a> {
       mut self,
       received_bytes: u64,
       total_bytes: Option<u64>,
+      validator: Option<crate::validator::ResumeValidator>,
+      prepare: impl FnOnce() -> crate::Result<()>,
    ) -> crate::Result<Active<Self>> {
-      let persist_mode = if self.item.total_bytes == total_bytes {
-         PersistMode::InMemoryOnly
-      } else {
-         PersistMode::ToDisk
-      };
-      let updated = self.manager.store.update_active_bytes(
+      let updated = self.manager.store.update_active_headers(
          self.path(),
          received_bytes,
          total_bytes,
-         persist_mode,
+         validator,
+         prepare,
       )?;
       Ok(match updated {
          Some(updated) => {
@@ -633,12 +636,11 @@ impl<'a> ActiveDownload<'a> {
       received_bytes: u64,
       total_bytes: Option<u64>,
    ) -> crate::Result<Active<Self>> {
-      let Some(updated) = self.manager.store.update_active_bytes(
-         self.path(),
-         received_bytes,
-         total_bytes,
-         PersistMode::InMemoryOnly,
-      )?
+      let Some(updated) =
+         self
+            .manager
+            .store
+            .update_active_bytes(self.path(), received_bytes, total_bytes)?
       else {
          return Ok(Active::NoLongerActive);
       };
@@ -924,7 +926,7 @@ mod tests {
          let request = read_request(&mut stalled).await;
          assert!(!request.contains("\r\nrange:"));
          stalled
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello")
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"v1\"\r\n\r\nhello")
             .await
             .unwrap();
 
@@ -933,6 +935,7 @@ mod tests {
          let (mut resumed, _) = listener.accept().await.unwrap();
          let request = read_request(&mut resumed).await;
          assert!(request.contains("\r\nrange: bytes=5-\r\n"));
+         assert!(request.contains("\r\nif-range: \"v1\"\r\n"));
          resumed
             .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nConnection: close\r\n\r\nworld")
             .await
@@ -1283,6 +1286,7 @@ mod tests {
             options,
             received_bytes: 0,
             total_bytes: None,
+            validator: None,
             status,
          })
          .unwrap();
@@ -1323,7 +1327,14 @@ mod tests {
       manager.pause(path).unwrap();
 
       assert!(matches!(
-         active.persist_headers(500, Some(1000)).unwrap(),
+         active
+            .persist_headers(
+               500,
+               Some(1000),
+               Some(crate::validator::ResumeValidator::ETag("\"new\"".into())),
+               || panic!("paused download must not replace its body")
+            )
+            .unwrap(),
          Active::NoLongerActive
       ));
 
@@ -1333,6 +1344,41 @@ mod tests {
       assert_eq!(stored.status, DownloadStatus::Paused);
       assert_eq!(stored.received_bytes, 0);
       assert_eq!(stored.total_bytes, None);
+      assert_eq!(stored.validator, None);
+   }
+
+   #[test]
+   fn test_validator_persists_even_when_total_does_not_change() {
+      for total in [None, Some(1000)] {
+         let (manager, dir, _events) = make_manager();
+         let path = "/tmp/validator.bin";
+         seed(&manager, path, DownloadStatus::InProgress);
+         let mut item = manager.store.find_by_path(path).unwrap().unwrap();
+         item.total_bytes = total;
+         item.validator = Some(crate::validator::ResumeValidator::ETag("\"old\"".into()));
+         manager.store.update(item.clone()).unwrap();
+         let validator = Some(crate::validator::ResumeValidator::ETag("\"new\"".into()));
+         let (_cancel_sender, cancel) = watch::channel(false);
+         let Active::Active(active) = ActiveDownload::new(&manager, item, cancel)
+            .persist_headers(0, total, validator.clone(), || Ok(()))
+            .unwrap()
+         else {
+            panic!("active");
+         };
+         let reloaded = DownloadStore::new(dir.path().join("downloads.json"));
+         reloaded.load().unwrap();
+         assert_eq!(
+            reloaded.find_by_path(path).unwrap().unwrap().validator,
+            validator
+         );
+         // A replacement response without a validator must clear the previous one.
+         active.persist_headers(0, total, None, || Ok(())).unwrap();
+         reloaded.load().unwrap();
+         assert_eq!(
+            reloaded.find_by_path(path).unwrap().unwrap().validator,
+            None
+         );
+      }
    }
 
    #[test]
@@ -1347,6 +1393,7 @@ mod tests {
             options: CreateOptions::default(),
             received_bytes: 0,
             total_bytes: Some(1000),
+            validator: None,
             status: DownloadStatus::InProgress,
          })
          .unwrap();
@@ -1354,7 +1401,9 @@ mod tests {
       let active = ActiveDownload::new(&manager, item, cancel);
 
       assert!(matches!(
-         active.persist_headers(500, Some(1000)).unwrap(),
+         active
+            .persist_headers(500, Some(1000), None, || Ok(()))
+            .unwrap(),
          Active::Active(_)
       ));
       assert_eq!(
@@ -1449,7 +1498,9 @@ mod tests {
       assert!(!Path::new(&temp_path).exists());
 
       assert!(matches!(
-         headers.persist_headers(7, Some(7)).unwrap(),
+         headers
+            .persist_headers(7, Some(7), None, || Ok(()))
+            .unwrap(),
          Active::NoLongerActive
       ));
       assert!(matches!(
